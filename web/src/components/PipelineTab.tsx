@@ -25,14 +25,19 @@ function steps(config: PipelineConfig, feature: Feature, cycleRuns: Run[]): Step
       out.push({ label: 'Approve plan', state: approved ? 'done' : feature.gate?.type === 'plan_approval' ? 'current' : 'pending' });
     }
   }
-  const dev = latest((r) => r.role === 'developer');
+  const dev = latest((r) => r.role === 'developer' && r.kind !== 'preflight');
   const fixes = cycleRuns.filter((r) => r.kind === 'fix').length;
   out.push({ label: followup ? 'Follow-up' : 'Develop', state: state(dev), detail: fixes ? `${fixes} fix round(s)` : undefined });
   if (config.validate) out.push({ label: 'Validate', state: state(latest((r) => r.role === 'validator')) });
   if (config.tester) out.push({ label: 'Tests', state: state(latest((r) => r.role === 'tester')) });
   if (config.reviewer) out.push({ label: 'Review', state: state(latest((r) => r.role === 'reviewer')) });
-  if (config.finalApproval) out.push({ label: 'Your approval', state: feature.status === 'done' ? 'done' : feature.gate?.type === 'final_approval' ? 'current' : 'pending' });
-  out.push({ label: 'Done', state: feature.status === 'done' ? 'done' : 'pending' });
+  if (config.preflight) out.push({ label: 'PR preflight', state: state(latest((r) => r.kind === 'preflight')) });
+  const hasPr = !!feature.prNumber;
+  if (config.finalApproval) out.push({ label: 'Your approval', state: hasPr ? 'done' : feature.gate?.type === 'final_approval' ? 'current' : 'pending' });
+  const finished = feature.status === 'build' && feature.agentStatus === 'completed' && !feature.gate;
+  out.push({ label: hasPr ? `PR #${feature.prNumber}` : 'Pull request', state: hasPr && feature.status !== 'build' ? 'done' : finished ? 'current' : 'pending' });
+  const merged = feature.pr?.state === 'merged' || feature.status === 'done';
+  out.push({ label: 'Merged by you', state: merged ? 'done' : feature.status === 'pr_open' ? 'current' : 'pending' });
   // Any step after the current one can't be "done" from an older pass.
   return out;
 }
@@ -61,7 +66,8 @@ export function PipelineTab({
   const byCycle = new Map<number, Run[]>();
   for (const r of [...runs].sort((a, b) => a.attempt - b.attempt)) byCycle.set(r.cycle, [...(byCycle.get(r.cycle) ?? []), r]);
   const cycles = [...byCycle.entries()].sort((a, b) => b[0] - a[0]);
-  const latest = cycles[0]?.[1] ?? [];
+  // Cycle 0 holds the backlog chat (writer runs); the step strip shows the latest build cycle.
+  const latest = cycles.find(([c]) => c > 0)?.[1] ?? [];
   const total = runs.reduce((s, r) => s + (runCost(r) ?? 0), 0);
   const now = Date.now();
 
@@ -108,7 +114,7 @@ export function PipelineTab({
             <div key={cycle} className="space-y-1.5">
               <div className="flex items-center justify-between text-[11px] uppercase tracking-wide text-muted-foreground">
                 <span>
-                  Cycle {cycle}
+                  {cycle === 0 ? 'Ticket chat' : `Cycle ${cycle}`}
                   {list[0]?.kind === 'followup' ? ' · follow-up' : ''}
                 </span>
                 <span>~{formatCost(cost)}</span>

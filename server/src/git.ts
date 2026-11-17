@@ -96,13 +96,15 @@ export async function allocateBranchAndPath(
   worktreeRoot: string,
   title: string,
   featureId: string,
+  issueNumber?: number | null,
 ): Promise<{ branch: string; worktreePath: string }> {
   const slug = slugify(title);
   const short = featureId.replace(/^[a-z]+_/, '').slice(0, 6);
   for (let i = 0; i < 50; i++) {
-    const suffix = i === 0 ? short : `${short}-${i}`;
-    const branch = `feature/${slug}-${suffix}`;
-    const worktreePath = path.join(worktreeRoot, `feature-${slug}-${suffix}`);
+    // With a GitHub issue: feat/<issue>-<slug>. Without one: feat/<slug>-<id>.
+    const name = issueNumber ? `${issueNumber}-${slug}${i === 0 ? '' : `-${i}`}` : `${slug}-${i === 0 ? short : `${short}-${i}`}`;
+    const branch = `feat/${name}`;
+    const worktreePath = path.join(worktreeRoot, `feat-${name}`);
     if (!(await branchExists(repo, branch)) && !fs.existsSync(worktreePath)) return { branch, worktreePath };
   }
   throw new Error('Could not allocate a unique branch name');
@@ -111,7 +113,8 @@ export async function allocateBranchAndPath(
 export async function createWorktree(repo: string, worktreePath: string, branch: string, baseBranch: string) {
   if (fs.existsSync(worktreePath)) throw new Error(`Worktree path already exists: ${worktreePath}`);
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
-  await git(repo, ['worktree', 'add', '-b', branch, worktreePath, baseBranch]);
+  // --no-track: the branch must not get the base branch as its upstream (a bare `git push` would then target it).
+  await git(repo, ['worktree', 'add', '--no-track', '-b', branch, worktreePath, baseBranch]);
 }
 
 export async function isWorktreeDirty(worktreePath: string): Promise<boolean> {

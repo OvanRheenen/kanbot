@@ -73,7 +73,9 @@ beforeAll(async () => {
   sh(repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'init');
   sh(tmp, 'init', '--bare', '-b', 'main', bare);
   sh(repo, 'remote', 'add', 'origin', 'https://github.com/acme/shop.git');
-  sh(repo, 'remote', 'set-url', '--push', 'origin', bare);
+  // All network traffic for the GitHub URL goes to the local bare repository.
+  sh(repo, 'config', `url.${bare}.insteadOf`, 'https://github.com/acme/shop.git');
+  sh(repo, 'push', 'origin', 'main');
   await new Promise<void>((r) => gh.listen(0, '127.0.0.1', () => r()));
   process.env.ORCH_GITHUB_API_URL = `http://127.0.0.1:${(gh.address() as any).port}`;
   m = {
@@ -95,21 +97,29 @@ afterAll(() => {
 });
 
 const feature = (id: string) => m.features.getFeature(id);
+/** The pipeline finished and the card waits in Build for "Create PR" (automatic PRs are off in this suite). */
+const ready = (id: string) => {
+  const f = feature(id);
+  return f.status === 'build' && f.agentStatus === 'completed' && !f.gate && f.run?.currentActivity === 'Ready for a pull request' && f;
+};
 const roles = (id: string) => m.runs.listRunsForFeature(id).reverse().map((r: any) => `${r.kind}:${r.role}:${r.status}`);
 
 describe('agent pipeline', () => {
   it('plans, waits for approval, develops, fixes failing validation, tests, and finishes', async () => {
     const project = await m.projects.createProject({
       path: repo,
-      pipeline: { validationCommands: ['test -f fix-validation.txt || (echo "FAIL: fix missing"; exit 1)'] },
+      // The classic plan → approve → develop → test pipeline; the issue/PR workflow is covered in workflow.test.ts.
+      pipeline: { planApproval: true, tester: true, reviewer: false, preflight: false, autoCreatePr: false, validationCommands: ['test -f fix-validation.txt || (echo "FAIL: fix missing"; exit 1)'] },
     });
-    expect(project.pipeline).toMatchObject({ plan: true, planApproval: true, validate: true, tester: true, reviewer: false, maxFixLoops: 2 });
+    expect(project.pipeline).toMatchObject({ plan: true, planApproval: true, validate: true, tester: true, reviewer: false, maxFixLoops: 2, maxReviewLoops: 5 });
     const f = m.features.createFeature(project.id, { title: 'Export orders', description: 'CSV export' });
     m.orch.orchestrator.startFeature(f.id);
 
     const gated = await waitFor(() => feature(f.id).gate?.type === 'plan_approval' && feature(f.id));
     expect(gated.gate.plan).toContain('feature-export-orders.txt');
     expect(gated.status).toBe('build');
+    expect(gated.branch).toMatch(/^feat\/export-orders-/);
+    expect(gated.baseRef).toBe('origin/main');
     // The planner is read-only.
     const plannerArgs = argsFor((a) => a.role === 'planner')[0].args;
     expect(plannerArgs[plannerArgs.indexOf('--permission-mode') + 1]).toBe('default');
@@ -121,7 +131,7 @@ describe('agent pipeline', () => {
     expect(() => m.orch.orchestrator.resolveGate(f.id, 'reject', {})).toThrow(/Describe/);
     m.orch.orchestrator.resolveGate(f.id, 'approve', { comment: 'Use semicolons' });
 
-    const done = await waitFor(() => feature(f.id).status === 'done' && feature(f.id), 30000);
+    const done = await waitFor(() => ready(f.id), 30000);
     expect(done.agentStatus).toBe('completed');
     expect(done.gate).toBeNull();
     expect(roles(f.id)).toEqual([
@@ -194,7 +204,7 @@ describe('agent pipeline', () => {
     expect(gated.gate.role).toBe('developer');
     expect(() => m.orch.orchestrator.resolveGate(f.id, 'answer', { answers: [' '] })).toThrow(/at least one/);
     m.orch.orchestrator.resolveGate(f.id, 'answer', { answers: ['CSV'] });
-    const done = await waitFor(() => feature(f.id).status === 'done' && feature(f.id));
+    const done = await waitFor(() => ready(f.id));
     delete process.env.FAKE_CLAUDE_CLARIFY;
     const runs = m.runs.listRunsForFeature(f.id).reverse();
     expect(runs.map((r: any) => r.kind)).toEqual(['feature', 'answer']);
@@ -205,7 +215,7 @@ describe('agent pipeline', () => {
 
   it('reviews, fixes findings, waits for final approval and opens a pull request', async () => {
     const project = m.projects.listProjects()[0];
-    await m.projects.updateProject(project.id, { pipeline: { plan: false, validate: false, tester: false, reviewer: true, finalApproval: true } });
+    await m.projects.updateProject(project.id, { pipeline: { plan: false, validate: false, tester: false, reviewer: true, finalApproval: true, prDraft: true } });
     await m.projects.updateProject(project.id, { roles: { reviewer: { model: 'claude-haiku-5-5', effort: 'low' } } });
     process.env.FAKE_REVIEW_VERDICT = 'changes_once';
     const f = m.features.createFeature(project.id, { title: 'Order history' });
@@ -224,7 +234,7 @@ describe('agent pipeline', () => {
     expect(gated.status).toBe('build');
 
     m.orch.orchestrator.resolveGate(f.id, 'approve');
-    const done = await waitFor(() => feature(f.id).status === 'done' && feature(f.id));
+    const done = await waitFor(() => ready(f.id));
     expect(done.gate).toBeNull();
 
     // Pull request: without a token it is refused; with one, the branch is pushed and the PR opened.
@@ -236,6 +246,7 @@ describe('agent pipeline', () => {
     const withPr = await m.pr.createPrForFeature(f.id);
     expect(withPr.prNumber).toBe(1);
     expect(withPr.prUrl).toBe('https://github.com/acme/shop/pull/1');
+    expect(withPr.status).toBe('pr_open');
     const post = ghRequests.find((r) => r.method === 'POST')!;
     expect(post.body).toMatchObject({ head: done.branch, base: 'main', title: 'Order history', draft: true });
     expect(post.body.body).toContain('Automated review: approved');
@@ -243,14 +254,16 @@ describe('agent pipeline', () => {
     // Idempotent: a second call reuses the open PR.
     const again = await m.pr.createPrForFeature(f.id);
     expect(again.prNumber).toBe(1);
-    expect(ghRequests.filter((r) => r.method === 'POST').length).toBe(1);
+    expect(ghRequests.filter((r) => r.method === 'POST' && r.url === '/repos/acme/shop/pulls').length).toBe(1);
+    // The PR is assigned to the token's user.
+    expect(ghRequests.find((r) => r.url === '/repos/acme/shop/issues/1/assignees')?.body).toEqual({ assignees: ['octo'] });
     // The token never reaches agents or logs.
     const events = m.runs.listRunsForFeature(f.id).flatMap((r: any) => m.runs.listEvents(r.id));
     expect(JSON.stringify(events)).not.toContain('ghp_testtoken');
     await m.github.setToken('');
   }, 60000);
 
-  it('waits for dependencies and stacks on an unmerged dependency branch', async () => {
+  it('waits for dependencies to be Done and never stacks on their branch', async () => {
     const project = m.projects.listProjects()[0];
     await m.projects.updateProject(project.id, { pipeline: { plan: false, validate: false, tester: false, reviewer: false, finalApproval: false } });
     const a = m.features.createFeature(project.id, { title: 'Cart model' });
@@ -260,20 +273,22 @@ describe('agent pipeline', () => {
     expect(() => m.features.setDependencies(a.id, [a.id])).toThrow(/itself/);
     expect(feature(b.id).blockedBy.map((d: any) => d.title)).toEqual(['Cart model']);
 
-    process.env.FAKE_CLAUDE_DELAY_MS = '300';
     m.orch.orchestrator.startFeature(b.id);
     await waitFor(() => feature(b.id).run?.currentActivity?.startsWith('Waiting for dependencies'));
+    m.orch.orchestrator.startFeature(a.id);
+    const doneA = await waitFor(() => ready(a.id));
+    // A finished pipeline is not enough: the dependency has to be Done (merged).
+    m.orch.orchestrator.tick();
     expect(feature(b.id).agentStatus).toBe('queued');
     expect(feature(b.id).worktreePath).toBeNull();
-    m.orch.orchestrator.startFeature(a.id);
-    const doneA = await waitFor(() => feature(a.id).status === 'done' && feature(a.id));
-    const doneB = await waitFor(() => feature(b.id).status === 'done' && feature(b.id));
-    process.env.FAKE_CLAUDE_DELAY_MS = '60';
-    expect(doneB.baseRef).toBe(doneA.branch);
+    m.features.moveFeature(a.id, 'done');
+    m.orch.orchestrator.tick();
+    const doneB = await waitFor(() => ready(b.id));
+    expect(doneB.baseRef).toBe('origin/main');
     expect(doneB.blockedBy).toEqual([]);
-    expect(fs.existsSync(path.join(doneB.worktreePath, 'feature-cart-model.txt'))).toBe(true);
+    expect(doneB.branch).not.toBe(doneA.branch);
+    expect(fs.existsSync(path.join(doneB.worktreePath, 'feature-cart-model.txt'))).toBe(false);
     const report = m.runs.getReport(doneB.currentRunId);
-    expect(report.changes.baseBranch).toBe(doneA.branch);
     expect(report.changes.commits.map((c: any) => c.subject)).toEqual(['feat: Checkout page']);
   }, 60000);
 
@@ -298,7 +313,7 @@ describe('agent pipeline', () => {
     process.env.FAKE_CLAUDE_DELAY_MS = '2600';
     const f = m.features.createFeature(project.id, { title: 'Slow tests' });
     m.orch.orchestrator.startFeature(f.id);
-    const done = await waitFor(() => feature(f.id).status === 'done' && feature(f.id), 40000);
+    const done = await waitFor(() => ready(f.id), 40000);
     process.env.FAKE_CLAUDE_DELAY_MS = '60';
     const events = m.runs.listEvents(done.currentRunId);
     expect(events.some((e: any) => e.kind === 'warning' && /No output from the agent/.test(e.summary))).toBe(true);

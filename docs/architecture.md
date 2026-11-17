@@ -9,7 +9,7 @@ Browser (React dashboard)
    │  REST /api/*        WebSocket /ws (server → client only)
    ▼
 Backend: Node + Express + ws (server/src/index.ts), run by tsx, no build step
-   │  SQLite (node:sqlite, WAL) at ~/.local-orchestrator/orchestrator.db
+   │  SQLite (node:sqlite, WAL) at ~/.kanbot/orchestrator.db
    │  in-process event bus (events.ts) → fan-out to every WS client
    │
    ├── spawns DETACHED agent processes: /bin/sh wrapper → `claude -p … --output-format stream-json`
@@ -21,7 +21,6 @@ Backend: Node + Express + ws (server/src/index.ts), run by tsx, no build step
 - Agents are **detached**, so they keep running when the backend stops. On startup `orchestrator.recover()` reattaches to them using the stored `log_offset` and the `exit_code` file. See [orchestrator-and-agents.md](orchestrator-and-agents.md).
 - All pipeline decisions are derived from DB state. See [pipeline.md](pipeline.md).
 - Web is a single-page app. In production the server serves `web/dist` (or `ORCH_WEB_DIST`); in dev, Vite serves the UI.
-- The **macOS app** (`desktop/`, Electron) starts this same backend as a child process (bundled Node + `server/dist/server.mjs`), or reuses one already listening, and shows the dashboard in a window. See [desktop-app.md](desktop-app.md).
 
 ## Ports
 
@@ -57,7 +56,7 @@ Backend: Node + Express + ws (server/src/index.ts), run by tsx, no build step
 - `publish(msg: ServerMessage)` emits `'message'`.
 - All realtime updates go through this. Message list: [api.md](api.md#websocket).
 
-## Data directory (`ORCH_DATA_DIR`, default `~/.local-orchestrator`)
+## Data directory (`ORCH_DATA_DIR`, default `~/.kanbot`)
 
 ```
 orchestrator.db         SQLite (WAL); override the path with ORCH_DB_FILE
@@ -80,8 +79,8 @@ runs/<runId>/
 |---|---|---|---|
 | `ORCH_HOST` | `127.0.0.1` | index.ts:14 | Bind address |
 | `ORCH_PORT` | `4317` | index.ts:15 | Backend port |
-| `ORCH_DATA_DIR` | `~/.local-orchestrator` | db.ts:11 | Data dir (read at import) |
-| `ORCH_WEB_DIST` | `<repo>/web/dist` | index.ts:18 | Built dashboard to serve (the Mac app points it at `Resources/web`) |
+| `ORCH_DATA_DIR` | `~/.kanbot` | db.ts:11 | Data dir (read at import) |
+| `ORCH_WEB_DIST` | `<repo>/web/dist` | index.ts:18 | Built dashboard to serve (for packaged installs) |
 | `ORCH_DB_FILE` | `<DATA_DIR>/orchestrator.db` | db.ts:129 | SQLite file |
 | `ORCH_CLAUDE_BIN` | `claude` | settings.ts:12,24 | Claude binary; **always overrides** the stored `claudeBinary` setting |
 | `ORCH_CLAUDE_HOME` | `os.homedir()` | catalog.ts:18 | Home used for MCP and skill discovery (tests) |
@@ -100,10 +99,9 @@ runs/<runId>/
 | root | `start` | `build -w web`, then server start |
 | root | `start:server` | Server only |
 | root | `build` | `vite build` (web only) |
-| root | `build:server` | esbuild bundle → `server/dist/server.mjs` (for the Mac app) |
-| root | `desktop:dev` / `desktop:dist` | Build everything, then launch Electron / package the .app ([desktop-app.md](desktop-app.md)) |
-| root | `test` | server vitest, then desktop vitest |
-| root | `typecheck` | server, web, then desktop `tsc --noEmit` |
+| root | `build:server` | esbuild bundle → `server/dist/server.mjs` (a single-file backend) |
+| root | `test` | server vitest |
+| root | `typecheck` | server, then web `tsc --noEmit` |
 | server | `dev`/`start`/`test`/`typecheck`/`build` | `tsx watch` / `tsx` / `vitest run` / `tsc` (with the `NODE_OPTIONS` above) / `node build.mjs` |
 | web | `dev`/`build`/`typecheck` | vite / vite build / tsc |
 
@@ -113,7 +111,6 @@ runs/<runId>/
 - **Web:** see [web-dashboard.md](web-dashboard.md#stack).
 - **Root:** `concurrently` only.
 - **Server dev:** `esbuild` (bundle for packaged installs).
-- **Desktop:** `electron` (pinned), `electron-builder`, `esbuild`, `vitest`. See [desktop-app.md](desktop-app.md).
 
 ## tsconfig
 
@@ -121,3 +118,10 @@ runs/<runId>/
 - Web: aliases `@` → `web/src`, `@shared` → `../shared`.
 
 `.gitignore`: `node_modules/`, `dist/`, `.orchestrator-data/`, `*.log`, `.DS_Store`.
+
+## GitHub sync loop
+
+`startSyncLoop` (`server/src/issues.ts`) is started from `index.ts` after `listen`. Every 5 s it checks whether
+`settings.syncIntervalSec` (default 60; 0 = off) has passed since the last pass and, if a token is configured, runs
+`syncProject` for every project. A sync that imported, closed or merged something calls `orchestrator.tick()` so tickets
+waiting for a dependency can start. A failing sync is logged once, not every pass. Details: [issue-pr-workflow.md](issue-pr-workflow.md).

@@ -112,3 +112,15 @@ The project's launch-preview endpoint renders these builders for a fake feature,
 - Usage is zero and the cost is 0.
 
 Reports are stored in `runs.report_json`, served at `GET /runs/:id/report`, and rendered in the UI Report tab. PR bodies reuse them ([github-prs.md](github-prs.md)).
+
+## Added by Kanbot (see [issue-pr-workflow.md](issue-pr-workflow.md))
+
+- **Prompts:** `buildRefinePrompt` (writer, new session: the ticket, the chat so far, the project's other tickets,
+  `WRITER_RULES`), `buildRefineReplyPrompt` (writer, resumed), `buildPreflightPrompt` (developer, resumed; marker
+  `<!-- orchestrator-step: preflight -->`). `HARD_RULES` (no push, no PRs, no `gh`, no remote migrations, no rebase or
+  stacking) is part of `devRules` and the preflight prompt. `featureSection` names the GitHub issue, size and labels.
+  `buildImplementPlanPrompt` says the plan is accepted as it is when the project has no plan gate.
+- **Report fields** (`extractSelfReport`): `needs_clarification` items may be `{question, options[]}` →
+  `needsClarification` + `clarificationOptions`; writer: `reply`, `decisions[]`, `issue{title, body, size, labels,
+  depends_on}`, `ready` (forced to false while decisions are listed); preflight: `pr_title`, `pr_body`, `human_actions[]`.
+  A JSON block with `reply`, `issue` or `pr_body` counts as a report.

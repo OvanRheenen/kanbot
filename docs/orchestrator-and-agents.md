@@ -30,7 +30,7 @@ Pipeline decision logic is in [pipeline.md](pipeline.md). Prompts are in [prompt
 - Reuses `feature.branch` and `feature.worktreePath` if the directory exists.
 - Otherwise:
   1. Computes each dependency's merged status (`isMerged`).
-  2. Picks the base with `chooseBaseRef`, which may stack the branch on one unmerged dependency branch.
+  2. Fetches the base branch (`freshBase`) and branches from `<remote>/<base>`. Branches are never stacked; a ticket with dependencies not Done waits in the queue.
   3. Calls `allocateBranchAndPath`, then `createWorktree`.
   4. Patches `{branch, worktreePath, baseRef}`.
 
@@ -203,3 +203,15 @@ Pipeline decision logic is in [pipeline.md](pipeline.md). Prompts are in [prompt
   - `compact_boundary`: "Context compacted".
 - Non-JSON lines become `stderr` events.
 - `result` (line 280) provides `isError = is_error || subtype !== 'success'`, `text`, `totalCostUsd`, `durationMs`, `numTurns` and `modelUsage`.
+
+## Added by Kanbot (see [issue-pr-workflow.md](issue-pr-workflow.md))
+
+- **`chat` / `startChat` / `enqueueRefine`**: backlog chat runs (`refine`, role `writer`, cycle 0). `start()` gives them the
+  main checkout as cwd and no worktree; `tick()` does not count them (or validation) against `settings.concurrency`;
+  `finalize` hands them to `finishRefine` instead of `advance`. `retry` re-queues a failed refine run.
+- **`preflight`** run kind: `start()` calls `freshBase` and `buildPreflightPrompt`, resuming the feature's session.
+- **`postPlan`**: after a completed planner run, the plan is posted on the GitHub issue.
+- **`complete`**: opens the pull request instead of moving the card to Done.
+- **Launch (`launch.ts`)**: `writer` is a read-only role. `ALWAYS_DENIED` is added to `--disallowedTools` for every role
+  (`git push`, `gh`, every `supabase db push` form). The model falls back to `ROLE_DEFAULT_MODEL[role]`.
+- **`childEnv`** also strips `GH_TOKEN` and `GITHUB_TOKEN`.

@@ -1,6 +1,7 @@
 import type {
   Catalog,
   Changes,
+  ChatMessage,
   DiffResult,
   Feature,
   FeatureStatus,
@@ -41,6 +42,7 @@ export type SettingsResponse = Settings & {
   editorPresets: { id: string; label: string }[];
   platform: string;
   github: GithubStatus;
+  roleDefaultModels?: Record<string, string>;
   apiVersion?: number;
 };
 
@@ -97,7 +99,7 @@ export const api = {
   deleteProject: (id: string) => req<{ ok: boolean }>('DELETE', `/projects/${id}`),
 
   features: (projectId: string) => req<Feature[]>('GET', `/projects/${projectId}/features`),
-  createFeature: (projectId: string, f: { title: string; description: string; priority: Priority }) =>
+  createFeature: (projectId: string, f: { title: string; description: string; priority: Priority; brainstorm?: boolean }) =>
     req<Feature>('POST', `/projects/${projectId}/features`, f),
   updateFeature: (id: string, f: Partial<{ title: string; description: string; priority: Priority; status: FeatureStatus; position: number; confirmCancel: boolean }>) =>
     req<Feature>('PATCH', `/features/${id}`, f),
@@ -134,6 +136,13 @@ export const api = {
   githubStatus: () => req<GithubStatus & { error?: string }>('GET', '/settings/github'),
   setGithubToken: (token: string) => req<GithubStatus>('PUT', '/settings/github', { token }),
   testNotification: () => req<{ ok: boolean; sent: boolean }>('POST', '/notifications/test', {}),
+
+  sync: (projectId: string) => req<{ imported: number; updated: number; closed: number; merged: number; repo: string }>('POST', `/projects/${projectId}/sync`, {}),
+  chat: (id: string) => req<ChatMessage[]>('GET', `/features/${id}/chat`),
+  sendChat: (id: string, message: string, answers: Record<string, string> = {}) => req<Feature>('POST', `/features/${id}/chat`, { message, answers }),
+  startChat: (id: string) => req<Feature>('POST', `/features/${id}/chat/start`, {}),
+  publishIssue: (id: string) => req<Feature>('POST', `/features/${id}/issue`, {}),
+  setHumanAction: (id: string, actionId: string, done: boolean) => req<Feature>('PATCH', `/features/${id}/human-actions`, { id: actionId, done }),
 
   events: (runId: string, after = 0) => req<RunEvent[]>('GET', `/runs/${runId}/events?after=${after}`),
   report: (runId: string) => req<Report>('GET', `/runs/${runId}/report`),

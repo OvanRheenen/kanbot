@@ -9,6 +9,7 @@ import { bus } from './events.ts';
 import { orchestrator } from './orchestrator.ts';
 import { setClientCounter } from './notify.ts';
 import { api } from './routes/api.ts';
+import { startSyncLoop, stopSyncLoop } from './issues.ts';
 import { stopAllTerminalCommands } from './terminal.ts';
 import type { ServerMessage } from '../../shared/types.ts';
 
@@ -45,7 +46,7 @@ function warnIfDashboardStale() {
         return Math.max(m, e.isDirectory() ? newest(p) : fs.statSync(p).mtimeMs);
       }, 0);
     if (Math.max(newest(src), newest(shared)) > built) {
-      console.warn('[orchestrator] WARNING: the dashboard build (web/dist) is older than its sources. Run `npm run build` (or `npm start`, which builds first).');
+      console.warn('[kanbot] WARNING: the dashboard build (web/dist) is older than its sources. Run `npm run build` (or `npm start`, which builds first).');
     }
   } catch {
     /* sources not present (packaged install) */
@@ -110,24 +111,26 @@ server.on('error', async (err: NodeJS.ErrnoException) => {
   }
   console.error(
     ours
-      ? `[orchestrator] A backend is already running at http://localhost:${PORT} (the Mac app or another \`npm start\`).\n` +
+      ? `[kanbot] A backend is already running at http://localhost:${PORT} (the Mac app or another \`npm start\`).\n` +
           `  Open that, or stop it first (find it with: lsof -nP -iTCP:${PORT} -sTCP:LISTEN), then run this again.\n` +
           `  Running agents are detached and survive a restart. To run a second backend, set ORCH_PORT.`
-      : `[orchestrator] Port ${PORT} is already used by another program. Stop it, or set ORCH_PORT to use a different port.`,
+      : `[kanbot] Port ${PORT} is already used by another program. Stop it, or set ORCH_PORT to use a different port.`,
   );
   process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[orchestrator] listening on http://${HOST === '127.0.0.1' ? 'localhost' : HOST}:${PORT}`);
-  console.log(`[orchestrator] data directory: ${DATA_DIR}`);
+  console.log(`[kanbot] listening on http://${HOST === '127.0.0.1' ? 'localhost' : HOST}:${PORT}`);
+  console.log(`[kanbot] data directory: ${DATA_DIR}`);
   orchestrator.recover();
+  startSyncLoop(() => orchestrator.tick());
 });
 
 function shutdown() {
   // Agents are detached and keep running; they are re-attached on next start.
-  console.log('[orchestrator] shutting down (running agents continue in the background)');
+  console.log('[kanbot] shutting down (running agents continue in the background)');
   orchestrator.shutdown();
+  stopSyncLoop();
   stopAllTerminalCommands();
   server.close();
   process.exit(0);

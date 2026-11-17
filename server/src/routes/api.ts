@@ -1,6 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import {
+  blankFeature,
   createFeature,
   deleteFeature,
   getFeature,
@@ -12,7 +13,9 @@ import {
   updateFeatureFields,
 } from '../features.ts';
 import { collectChanges, expandHome, getDiff, isWorktreeDirty, removeWorktree, validateRepoPath, type DiffScope } from '../git.ts';
-import { GithubError, githubStatus, setToken, verifyToken } from '../github.ts';
+import { GithubError, getToken, githubStatus, setToken, verifyToken } from '../github.ts';
+import { listChat } from '../chat.ts';
+import { publishIssue, syncProject } from '../issues.ts';
 import { notify } from '../notify.ts';
 import { createPrForFeature } from '../pr.ts';
 import { detectValidationCommands } from '../validation.ts';
@@ -37,8 +40,8 @@ import {
 } from '../terminal.ts';
 import path from 'node:path';
 import { buildClaudeArgs, previewCommand, resolveLaunchConfig, resumeCommand } from '../launch.ts';
-import { buildPlanPrompt, buildPrompt, buildReviewerPrompt, buildTesterPrompt } from '../prompt.ts';
-import { ACTIVE_AGENT_STATUSES, API_VERSION, CLAUDE_ROLES, type Feature, type FeatureStatus } from '../../../shared/types.ts';
+import { buildPlanPrompt, buildPrompt, buildRefinePrompt, buildReviewerPrompt, buildTesterPrompt } from '../prompt.ts';
+import { ACTIVE_AGENT_STATUSES, API_VERSION, CLAUDE_ROLES, ROLE_DEFAULT_MODEL, type FeatureStatus } from '../../../shared/types.ts';
 
 type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
 const h = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
@@ -64,6 +67,7 @@ api.get('/settings', h(() => ({
   editorPresets: EDITOR_PRESETS.map((p) => ({ id: p.id, label: p.label })),
   platform: process.platform,
   github: githubStatus(),
+  roleDefaultModels: ROLE_DEFAULT_MODEL,
   apiVersion: API_VERSION,
 })));
 /** Store (validated) or clear the GitHub token. The token itself is never returned. */
@@ -112,18 +116,15 @@ api.patch('/projects/:id', h((req) => updateProject(req.params.id, req.body ?? {
 api.get('/projects/:id/launch-preview', h((req) => {
   const project = getProject(req.params.id);
   const settings = getSettings();
-  const sampleFeature: Feature = {
-    id: 'ftr_preview', projectId: project.id, title: '<feature title>', description: '<feature description>', priority: 'medium', status: 'build', position: 0,
-    branch: null, worktreePath: null, sessionId: null, agentStatus: null, currentRunId: null, dependsOn: [], blockedBy: [], gate: null, baseRef: null,
-    prUrl: null, prNumber: null, createdAt: '', updatedAt: '',
-  };
-  const branch = 'feature/<slug>';
+  const sampleFeature = blankFeature({ id: 'ftr_preview', projectId: project.id, title: '<ticket title>', description: '<issue text>', status: 'build' });
+  const branch = 'feat/<issue>-<slug>';
   const roles = Object.fromEntries(
     CLAUDE_ROLES.map((role) => {
       const cfg = resolveLaunchConfig(project, settings, role);
       cfg.capabilities = prepareCapabilities(project, cfg.profile, { dir: path.join(RUNS_DIR, '<run>', 'capabilities'), write: false });
       const prompt =
-        role === 'planner' ? buildPlanPrompt(sampleFeature, project, branch, cfg)
+        role === 'writer' ? buildRefinePrompt(sampleFeature, project, [], [], cfg)
+          : role === 'planner' ? buildPlanPrompt(sampleFeature, project, branch, cfg)
           : role === 'tester' ? buildTesterPrompt(sampleFeature, project, branch, project.baseBranch, cfg)
             : role === 'reviewer' ? buildReviewerPrompt(sampleFeature, project, branch, project.baseBranch, cfg)
               : buildPrompt(sampleFeature, project, branch, 1, cfg);
@@ -152,7 +153,32 @@ api.delete('/projects/:id', h(async (req) => {
 
 // ---- Features ----
 api.get('/projects/:id/features', h((req) => listFeatures(req.params.id)));
-api.post('/projects/:id/features', h((req) => createFeature(req.params.id, req.body ?? {})));
+/**
+ * New ticket. With `brainstorm` the text is the opening message of the backlog chat: the writer agent turns
+ * it into an issue. Without it the ticket is created as written, and published as a GitHub issue right away
+ * when a token is configured.
+ */
+api.post('/projects/:id/features', h(async (req) => {
+  const body = req.body ?? {};
+  const text = String(body.description ?? '').trim();
+  const title = String(body.title ?? '').trim() || text.split('\n')[0].slice(0, 80);
+  const feature = createFeature(req.params.id, { ...body, title });
+  if (body.brainstorm) return orchestrator.startChat(feature.id);
+  if (getToken()) {
+    try {
+      return await publishIssue(feature.id);
+    } catch (err: any) {
+      notify({ title: 'Could not create the GitHub issue', body: `${feature.title}: ${err.message}`, level: 'error', featureId: feature.id, projectId: feature.projectId });
+    }
+  }
+  return getFeature(feature.id);
+}));
+/** Pull issues and pull request state from GitHub onto the board. */
+api.post('/projects/:id/sync', h(async (req) => {
+  const result = await syncProject(req.params.id);
+  orchestrator.tick(); // merged dependencies unblock queued tickets
+  return result;
+}));
 api.post('/projects/:id/reorder', h((req) => {
   const { status, ids } = req.body ?? {};
   if (!Array.isArray(ids)) throw new HttpError(400, 'ids must be an array');
@@ -171,10 +197,26 @@ api.patch('/features/:id', h(async (req) => {
   const { title, description, priority, status, position, confirmCancel } = req.body ?? {};
   let feature = getFeature(id);
   if (title !== undefined || description !== undefined || priority !== undefined) {
+    const textChanged = (title !== undefined && title.trim() !== feature.title) || (description !== undefined && description !== feature.description);
     feature = updateFeatureFields(id, { title, description, priority });
+    // The issue on GitHub follows edits made on the board. The draft is dropped: the edited text is the ticket now.
+    if (textChanged) {
+      patchFeatureState(id, { draft: null });
+      if (feature.issueNumber && getToken()) {
+        await publishIssue(id).catch((err) => {
+          throw new HttpError(502, `Saved on the board, but GitHub was not updated: ${err.message}`);
+        });
+      }
+    }
   }
   if (status && status !== feature.status) {
+    if (status === 'pr_open' && !feature.prNumber) throw new HttpError(409, 'This ticket has no pull request yet. PR Open is filled automatically when the pipeline opens one.');
     if (status === 'build') {
+      if (feature.status === 'backlog') {
+        if (feature.openDecisions > 0) throw new HttpError(409, 'Answer the open decisions in the ticket chat first.');
+        // A ticket is built from its GitHub issue, so the issue has to exist before the agents start.
+        if (!feature.issueNumber && getToken()) await publishIssue(id);
+      }
       // Starts the agent, or (auto-start off) leaves the card waiting for POST /features/:id/start.
       feature = orchestrator.enterBuild(id, typeof position === 'number' ? position : undefined);
     } else {
@@ -213,6 +255,28 @@ api.post('/features/:id/gate', h((req) => {
   const { action, comment, answers } = req.body ?? {};
   if (!['approve', 'reject', 'answer'].includes(action)) throw new HttpError(400, 'action must be approve, reject or answer');
   return orchestrator.resolveGate(req.params.id, action, { comment, answers });
+}));
+// ---- Backlog chat (the writer agent drafts the issue) ----
+api.get('/features/:id/chat', h((req) => {
+  getFeature(req.params.id);
+  return listChat(req.params.id);
+}));
+api.post('/features/:id/chat', h((req) => {
+  const answers = req.body?.answers && typeof req.body.answers === 'object' ? (req.body.answers as Record<string, string>) : {};
+  return orchestrator.chat(req.params.id, String(req.body?.message ?? ''), answers);
+}));
+/** Start the chat for a ticket that has none yet (an imported issue that needs sharpening). */
+api.post('/features/:id/chat/start', h((req) => orchestrator.startChat(req.params.id)));
+/** Create or update the GitHub issue from the current draft, even with decisions open. */
+api.post('/features/:id/issue', h(async (req) => {
+  return publishIssue(req.params.id);
+}));
+/** Tick a human step off (or back on). Steps tied to a PR label follow the label on the next sync. */
+api.patch('/features/:id/human-actions', h((req) => {
+  const f = getFeature(req.params.id);
+  const { id, done } = req.body ?? {};
+  if (!f.humanActions.some((a) => a.id === id)) throw new HttpError(404, 'Unknown human action');
+  return patchFeatureState(f.id, { humanActions: f.humanActions.map((a) => (a.id === id ? { ...a, done: done !== false } : a)) });
 }));
 api.post('/features/:id/continue', h((req) => orchestrator.continuePipeline(req.params.id)));
 api.post('/features/:id/pr', h((req) => createPrForFeature(req.params.id)));

@@ -9,7 +9,7 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof
 type DatabaseSync = DatabaseSyncType;
 
 export const DATA_DIR = path.resolve(
-  process.env.ORCH_DATA_DIR || path.join(os.homedir(), '.local-orchestrator'),
+  process.env.ORCH_DATA_DIR || path.join(os.homedir(), '.kanbot'),
 );
 export const RUNS_DIR = path.join(DATA_DIR, 'runs');
 
@@ -120,6 +120,28 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE projects ADD COLUMN mcp_servers_json TEXT NOT NULL DEFAULT '[]';
   ALTER TABLE projects ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';
+  `,
+  `
+  ALTER TABLE features ADD COLUMN issue_number INTEGER;
+  ALTER TABLE features ADD COLUMN issue_url TEXT;
+  ALTER TABLE features ADD COLUMN issue_state TEXT;
+  ALTER TABLE features ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]';
+  ALTER TABLE features ADD COLUMN human_actions_json TEXT NOT NULL DEFAULT '[]';
+  ALTER TABLE features ADD COLUMN pr_json TEXT;
+  ALTER TABLE features ADD COLUMN chat_session_id TEXT;
+  ALTER TABLE features ADD COLUMN draft_json TEXT;
+  ALTER TABLE projects ADD COLUMN repo_slug TEXT NOT NULL DEFAULT '';
+  CREATE UNIQUE INDEX features_issue ON features(project_id, issue_number) WHERE issue_number IS NOT NULL;
+  CREATE TABLE chat_messages (
+    id TEXT PRIMARY KEY,
+    feature_id TEXT NOT NULL REFERENCES features(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    decisions_json TEXT NOT NULL DEFAULT '[]',
+    run_id TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX chat_messages_feature ON chat_messages(feature_id, created_at);
   `,
 ];
 

@@ -1,4 +1,4 @@
-import { AlertTriangle, PauseCircle, CheckCircle2, CircleDashed, ClipboardCheck, Clock, Link2, Loader2, MessageCircleQuestion, ShieldCheck, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleDashed, ClipboardCheck, Clock, GitPullRequestArrow, Link2, Loader2, MessageCircleQuestion, ShieldCheck, XCircle } from 'lucide-react';
 import type { AgentRole, AgentStatus, Feature, GateType, Priority, Run } from '@shared/types.ts';
 import { Badge } from './ui/badge';
 import { Progress } from './ui/progress';
@@ -40,8 +40,17 @@ export function PriorityBadge({ priority }: { priority: Priority }) {
   );
 }
 
-/** A step finished in Build but nothing is waiting or running: the pipeline needs "Continue". */
+/**
+ * The last step finished in Build and nothing is waiting or running: the pipeline is done and the pull request
+ * has not been opened yet (it is being opened, there is no GitHub token, or automatic PRs are off).
+ */
 export const isPaused = (f: Feature) => f.status === 'build' && f.agentStatus === 'completed' && !f.gate;
+
+/** Backlog ticket with decision cards from the writer agent that still need an answer. */
+export const hasOpenDecisions = (f: Feature) => f.status === 'backlog' && f.openDecisions > 0;
+
+/** Human steps on the ticket that are still open (migrations, tests that need Docker, …). */
+export const openHumanActions = (f: Feature) => (f.status === 'done' ? [] : f.humanActions.filter((a) => !a.done));
 
 /** In Build with no agent assigned: auto-start is off and the card waits for ▶ (POST /features/:id/start). */
 export const isReadyToStart = (f: Feature) => f.status === 'build' && !f.agentStatus && !f.gate;
@@ -83,6 +92,7 @@ const ROLE_LABEL: Record<AgentRole, string> = {
   tester: 'Tester',
   reviewer: 'Reviewer',
   validator: 'Validation',
+  writer: 'Issue writer',
 };
 export const roleLabel = (r: AgentRole) => ROLE_LABEL[r] ?? r;
 
@@ -105,6 +115,10 @@ export function runLabel(run: Pick<Run, 'kind' | 'role' | 'fixReason'>): string 
       return `${roleLabel(run.role)} (answers)`;
     case 'followup':
       return 'Follow-up';
+    case 'refine':
+      return 'Issue draft';
+    case 'preflight':
+      return 'PR preflight';
   }
 }
 
@@ -127,8 +141,8 @@ export function PipelineChip({ feature }: { feature: Feature }) {
   }
   if (isPaused(feature)) {
     return (
-      <Badge variant="gold" title="The last step finished but the next one did not start. Open the card and click Continue pipeline.">
-        <PauseCircle className="h-3 w-3" /> Paused
+      <Badge variant="gold" title="The pipeline finished. Open the card and click Create PR if the pull request does not appear.">
+        <GitPullRequestArrow className="h-3 w-3" /> Ready for PR
       </Badge>
     );
   }
@@ -151,5 +165,10 @@ export function PipelineChip({ feature }: { feature: Feature }) {
 }
 
 export function needsAttention(f: Feature) {
-  return isWaiting(f) || (f.status === 'build' && f.agentStatus === 'failed');
+  return (
+    isWaiting(f) ||
+    hasOpenDecisions(f) ||
+    (f.status === 'build' && f.agentStatus === 'failed') ||
+    (f.status === 'pr_open' && (openHumanActions(f).length > 0 || f.pr?.checks === 'failing' || f.pr?.state === 'closed'))
+  );
 }

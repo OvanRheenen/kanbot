@@ -1,8 +1,8 @@
 # GitHub integration and pull requests
 
-Source files: `server/src/github.ts`, `server/src/pr.ts`
+Source files: `server/src/github.ts`, `server/src/pr.ts`, `server/src/issues.ts`, `server/src/humanActions.ts`
 
-The orchestrator only **pushes branches and opens PRs**. It never merges, never force-pushes and never deletes branches.
+The orchestrator **pushes branches, opens PRs, and reads and writes issues**. It never merges, never force-pushes and never deletes branches. Agents never touch GitHub at all (see `ALWAYS_DENIED` in `launch.ts`).
 
 ## Token (`github.ts`)
 
@@ -35,7 +35,10 @@ The orchestrator only **pushes branches and opens PRs**. It never merges, never 
   - 401 → a friendly message.
   - Other errors include the `errors[]` details.
 - **`findOpenPr(repo, branch)`**: `GET /repos/o/r/pulls?state=open&head=owner:branch`.
-- **`createPullRequest(repo, {head, base, title, body, draft})`**.
+- **`createPullRequest(repo, {head, base, title, body, draft})`**, `getPull`, `updatePull`, `checksState(repo, sha)` (check runs → `failing` > `pending` > `passing`, null when there are none).
+- Issues: `listOpenIssues` (pull requests filtered out, up to 500), `getIssue`, `createIssue`, `updateIssue`, `commentOnIssue`, `addAssignees`, `requestReviewers`.
+- `tokenLogin()`: the token's user, cached.
+- `fetchBranch(cwd, remote, branch)`: authenticated fetch into `refs/remotes/<remote>/<branch>` (2 min timeout).
 
 ## Authenticated push
 
@@ -46,28 +49,34 @@ The orchestrator only **pushes branches and opens PRs**. It never merges, never 
 
 ## Create PR flow (`pr.ts`)
 
-**`createPrForFeature(featureId)`** (line 59). Called by `POST /api/features/:id/pr`, or automatically by `complete()` when `pipeline.autoCreatePr` is on and a token exists.
+**`createPrForFeature(featureId)`**. Called by `Orchestrator.complete()` when the pipeline finishes (`pipeline.autoCreatePr`,
+default on, and a token exists), or by `POST /api/features/:id/pr` ("Create PR").
 
-1. Preconditions:
-   - A token must exist (else 400).
-   - No active agent (else 409).
-   - The branch and worktree must exist (else 409).
-2. `remote = pipeline.remote || 'origin'`, then `parseRemote`. A non-GitHub remote → 400.
-3. `base = feature.baseRef || project.baseBranch`. **For a stacked feature, if the base branch isn't on the remote yet, it is pushed first.**
-4. Push the feature branch from the worktree.
-5. Reuse an existing open PR if `findOpenPr` finds one. Otherwise create a PR with `draft = pipeline.prDraft`. If GitHub returns a **422 mentioning "draft"** (drafts aren't available on every plan), it retries with `draft:false`.
-6. Patch `prUrl` and `prNumber` on the feature and notify "Pull request #N ready" (success).
-7. Error mapping: `GithubError` 401/400 → HTTP 400; anything else → 502. When auto-create fails, the error becomes a run event and an error notification.
+1. Preconditions: a token (else 400), no active agent (else 409), an existing branch and worktree (else 409).
+2. `projectRepo(project)` (`issues.ts`) resolves `owner/repo` from the configured remote URL (`git config remote.<name>.url`,
+   so `url.*.insteadOf` rewrites do not hide the GitHub repository). A non-GitHub remote → 400.
+3. The base is always `project.baseBranch`. Branches are never stacked.
+4. `preflightData` reads the latest cycle's developer reports: PR title and body from the newest report that has a `pr_body`,
+   plus `human_actions` and `tests.not_run` from the preflight run onwards. Without a preflight, the body comes from `buildPrBody`.
+5. Human actions = `actionsFromRules` (changed paths vs `pipeline.humanActionRules`) + `actionsFromReport`, merged with the stored
+   ones by `mergeActions` (`humanActions.ts`). A rule action wins over an agent action with the same label; a step already
+   ticked off stays ticked.
+6. The body gets `Closes #<issue>` when it has no closing keyword for the ticket's issue, and a
+   "Human action required before merging" checklist when any action is open.
+7. Push the branch (never forced). Reuse the open PR for the branch (its title and body are updated) or create one with
+   `draft = pipeline.prDraft` (default off). A 422 mentioning "draft" retries as a regular PR.
+8. On a new PR with `pipeline.assignPr`: assign the token's user and request reviews from `pipeline.prReviewers`
+   (empty = the token's user). GitHub refuses a review request from the PR's own author; that is logged as a warning.
+9. Store `prUrl`, `prNumber`, `humanActions`, `pr {state: open}` and move a Build card to **PR Open**. Notification:
+   attention when human actions are open, success otherwise.
+10. Error mapping: `GithubError` 401/400 → HTTP 400; anything else → 502. When the automatic PR fails, the card stays in Build
+    with an error event; "Create PR" or "Continue pipeline" retries.
 
-**PR body.** `buildPrBody(feature, project)` (line 10) uses the reports from the **latest cycle** only. Sections, in order:
-1. **Summary**: the first developer `feature`/`followup` report summary + implementation details (≤4000 characters).
-2. `<details>` **Requirements** (≤6000 characters) and **Implementation plan** (≤8000 characters).
-3. **Validation**: ✅/❌ per command from the last validator run.
-4. **Tests**: from the tester report, or the last developer report.
-5. **Automated review**: verdict, summary and finding severities.
-6. **Documentation updated**: deduped across all reports.
-7. **Outstanding issues**: from the last developer report.
-8. **Footer**: "Implemented by Claude Code agents… Review before merging."
+The card reaches **Done** only through `refreshPr` (`issues.ts`) when the pull request is merged. See
+[issue-pr-workflow.md](issue-pr-workflow.md).
+
+**PR body fallback.** `buildPrBody(feature, project)` uses the reports from the **latest cycle**: Summary, Requirements and plan
+(collapsed), Validation, Tests, Automated review, Documentation updated, Outstanding issues, footer.
 
 ## UI
 

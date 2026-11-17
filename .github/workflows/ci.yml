@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    # The repo's default branch is currently claude/affectionate-wright-b6ps16; main is listed for after a rename.
-    branches: [main, claude/affectionate-wright-b6ps16]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -20,8 +19,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - run: git config --global user.email ci@example.com && git config --global user.name CI
       - run: npm run typecheck
       - run: npm test

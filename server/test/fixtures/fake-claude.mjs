@@ -9,9 +9,18 @@
 //   FAKE_CLAUDE_CLARIFY    role that asks a question (until the prompt contains answers)
 //   FAKE_REVIEW_VERDICT    approve | changes_once (request changes until a review fix was committed) | changes
 //   FAKE_CLAUDE_ARGS_DIR   record args + cwd of every invocation
+//   FAKE_WRITER_DECISION=1 the writer asks one decision before its draft is ready
+//   FAKE_TESTS_NOT_RUN     a test command the preflight reports as not run (e.g. "pnpm e2e:backend")
+// The writer role (backlog chat) drafts an issue. A developer prompt with the preflight marker merges nothing but
+// reports a PR title/body and human actions. A title containing "migration" makes the developer add a file
+// under supabase/migrations/.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 
+// Only headless agent runs (`-p <prompt>`) are played; anything else (`claude mcp list`, `--version`, …) is a no-op,
+// so catalog lookups never write to the repository they run in.
+if (!process.argv.includes('-p')) process.exit(0);
 const delay = Number(process.env.FAKE_CLAUDE_DELAY_MS ?? 150);
 const fail = process.env.FAKE_CLAUDE_FAIL === '1';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -20,13 +29,24 @@ const prompt = args[args.indexOf('-p') + 1] ?? '';
 const role = (prompt.match(/<!-- orchestrator-role: (\w+) -->/) ?? [])[1] ?? 'developer';
 const fixReason = (prompt.match(/<!-- orchestrator-fix: (\w+) -->/) ?? [])[1] ?? null;
 const answered = prompt.includes('Answers to your questions');
-const title = (prompt.match(/\*\*Title:\*\* (.*)/) ?? [])[1] ?? (prompt.includes('Follow-up request') ? `followup ${Date.now()}` : 'feature');
+const preflight = prompt.includes('<!-- orchestrator-step: preflight -->');
+const issueNo = (prompt.match(/issue #(\d+)/) ?? [])[1] ?? null;
+const resumedSession = args.includes('--resume') ? args[args.indexOf('--resume') + 1] : null;
+// A resumed session remembers its ticket's title, like the real session would.
+const titleMemo = resumedSession ? `${os.tmpdir()}/fake-claude-title-${resumedSession}` : null;
+const title =
+  (prompt.match(/\*\*Title:\*\* (.*)/) ?? [])[1] ??
+  (prompt.match(/Working title: (.*)/) ?? [])[1] ??
+  (prompt.match(/\*\*Current title:\*\* (.*)/) ?? [])[1] ??
+  (prompt.includes('Follow-up request') ? `followup ${Date.now()}` : undefined) ??
+  (titleMemo && fs.existsSync(titleMemo) ? fs.readFileSync(titleMemo, 'utf8') : 'feature');
 const resumed = args.includes('--resume') ? args[args.indexOf('--resume') + 1] : null;
 const session = resumed ?? 'sess-' + Math.random().toString(36).slice(2, 10);
 if (process.env.FAKE_CLAUDE_ARGS_DIR) {
   fs.mkdirSync(process.env.FAKE_CLAUDE_ARGS_DIR, { recursive: true });
   fs.writeFileSync(`${process.env.FAKE_CLAUDE_ARGS_DIR}/${session}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`, JSON.stringify({ args, cwd: process.cwd(), role }));
 }
+if (!resumed) fs.writeFileSync(`${os.tmpdir()}/fake-claude-title-${session}`, title);
 const model = args.includes('--model') ? args[args.indexOf('--model') + 1] : 'claude-sonnet-5-5';
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let n = 0;
@@ -51,6 +71,24 @@ await sleep(delay);
 let report;
 if (process.env.FAKE_CLAUDE_CLARIFY === role && !answered) {
   report = { summary: 'I need a decision before continuing.', needs_clarification: ['Should the export be CSV or JSON?'], outstanding_issues: [] };
+} else if (role === 'writer') {
+  const decided = prompt.includes('Decisions:\n- ');
+  const ask = process.env.FAKE_WRITER_DECISION === '1' && !decided && !resumed;
+  const said = (prompt.match(/replied in the ticket chat:\n\n([\s\S]*?)\n\nUpdate the draft/) ?? [])[1];
+  report = {
+    reply: ask ? 'I drafted the issue. One choice is yours.' : said ? 'Updated the draft with your input.' : 'The issue is ready.',
+    decisions: ask
+      ? [{ id: 'd1', question: 'Which export format?', options: [{ label: 'CSV', description: 'Opens in a spreadsheet' }, { label: 'JSON', description: 'For scripts' }] }]
+      : [],
+    issue: {
+      title: title.replace(/^<|>$/g, '').slice(0, 70),
+      body: `## Why\nUsers asked for it.\n\n## What\nChange \`README.md\`.${said ? `\n\nNotes: ${said.split('\n').join(' ').slice(0, 200)}` : ''}\n\n## Edge cases\nNone.\n\n## Data\nNone.\n\n## Acceptance\n- [ ] It works`,
+      size: 'S',
+      labels: ['enhancement'],
+      depends_on: [],
+    },
+    ready: !ask,
+  };
 } else if (role === 'planner') {
   report = { summary: `Plan for ${title}.`, plan: `1. Add \`feature-${slug}.txt\`\n2. Add a test\n3. Update docs`, needs_clarification: [], outstanding_issues: [] };
 } else if (role === 'reviewer') {
@@ -75,6 +113,9 @@ if (process.env.FAKE_CLAUDE_CLARIFY === role && !answered) {
   if (role === 'tester') {
     file = `test-${slug}.test.txt`;
     msg = `test: ${title}`;
+  } else if (preflight) {
+    file = 'build-log.txt';
+    msg = 'chore: pr preflight';
   } else if (fixReason) {
     file = `fix-${fixReason}.txt`;
     msg = `fix(${fixReason}): ${title}`;
@@ -83,6 +124,10 @@ if (process.env.FAKE_CLAUDE_CLARIFY === role && !answered) {
     msg = `feat: ${title}`;
   }
   fs.appendFileSync(file, `${role}: ${title} ${Date.now()}\n`);
+  if (!preflight && !fixReason && role === 'developer' && /migration/i.test(title)) {
+    fs.mkdirSync('supabase/migrations', { recursive: true });
+    fs.writeFileSync(`supabase/migrations/0001_${slug}.sql`, '-- migration\n');
+  }
   // Demo repos with src/math.js get a real code change for the diff viewer.
   if (role === 'developer' && fs.existsSync('src/math.js')) {
     const fn = slug.replace(/-(.)/g, (_, c) => c.toUpperCase()).replace(/[^a-zA-Z0-9]/g, '') || 'feature';
@@ -105,6 +150,14 @@ if (process.env.FAKE_CLAUDE_CLARIFY === role && !answered) {
     docs_updated: ['agent-docs/features.md'],
     needs_clarification: [],
   };
+  if (preflight) {
+    const notRun = process.env.FAKE_TESTS_NOT_RUN ? [`${process.env.FAKE_TESTS_NOT_RUN} — needs Docker`] : [];
+    report.summary = 'Merged the base branch and prepared the pull request.';
+    report.tests.not_run = notRun;
+    report.pr_title = issueNo ? `PR for issue #${issueNo}` : 'PR from preflight';
+    report.pr_body = `## Summary\nPrepared by the preflight.${issueNo ? `\n\nCloses #${issueNo}` : ''}\n\n## Tests\n- unit: passed${notRun.length ? `\n- ${process.env.FAKE_TESTS_NOT_RUN}: not run` : ''}`;
+    report.human_actions = fs.existsSync('supabase/migrations') ? [{ label: 'Migration', detail: 'Apply the migration' }] : [];
+  }
 }
 
 const text = `Done.\n\n\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``;

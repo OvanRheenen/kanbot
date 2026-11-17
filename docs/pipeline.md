@@ -5,8 +5,9 @@ Source files: `server/src/pipeline.ts` (pure decision logic), `server/src/orches
 ## Overview
 
 ```
-plan → [plan_approval gate] → feature (develop) → validate ⇄ fix(validation) → test → validate
-     → review ⇄ fix(review) → [final_approval gate] → done → (optional auto PR)
+plan → [plan_approval gate] → feature (develop) → validate ⇄ fix(validation) → [test → validate]
+     → review ⇄ fix(review) → preflight → validate → [final_approval gate] → done = open the PR → PR Open
+Backlog chat runs (kind refine, role writer, cycle 0) are outside the pipeline: nextStep returns idle for them.
 Any agent run that returns needs_clarification → [clarification gate] → answer run (same role and session)
 ```
 
@@ -17,15 +18,21 @@ Any agent run that returns needs_clarification → [clarification gate] → answ
   | Field | Default |
   |---|---|
   | `plan` | true |
-  | `planApproval` | true |
+  | `planApproval` | false ("Implement automatically") |
   | `validate` | true |
   | `validationCommands` | `[]` (auto-detect) |
-  | `tester` | true |
-  | `reviewer` | false |
+  | `tester` | false |
+  | `reviewer` | true |
   | `finalApproval` | false |
-  | `maxFixLoops` | 2 (0-5) |
-  | `autoCreatePr` | false |
-  | `prDraft` | true |
+  | `maxFixLoops` | 2 (0-5), validation fixes |
+  | `maxReviewLoops` | 5 (0-10), review ⇄ fix rounds |
+  | `preflight` | true |
+  | `postPlanToIssue` | true |
+  | `assignPr` | true |
+  | `prReviewers` | `[]` (the token's user) |
+  | `humanActionRules` | the Supabase migration rule |
+  | `autoCreatePr` | true |
+  | `prDraft` | false |
   | `remote` | `origin` |
 
 ## Feature column (`FeatureStatus`)
@@ -35,11 +42,13 @@ Any agent run that returns needs_clarification → [clarification gate] → answ
   - With auto-start off, the card waits in Build, **ready to start**: `agentStatus` is null, there is no gate and no new run. `tick()` only schedules queued runs, so it stays put. `isPaused` and `continuePipeline` need `agentStatus = completed`, so it never looks paused. `POST /features/:id/start` (the ▶ button) calls `startFeature`.
   - Follow-ups, Retry, gate resolutions and Continue pipeline always start right away.
   - `enqueueRun` also forces the card into build.
-- **build → done**: only `Orchestrator.complete()` (orchestrator.ts:751). It runs on a pipeline `done` decision or a final-approval approve.
+- **build → pr_open**: `createPrForFeature`, called by `Orchestrator.complete()` on a pipeline `done` decision or a final-approval approve (or by "Create PR").
+- **pr_open → done**: `refreshPr` (`issues.ts`) when the pull request is merged. A Backlog card whose issue was closed on GitHub also moves to Done.
+- **backlog → build** from the API first publishes a draft as a GitHub issue and refuses while decision cards are open.
 - **Manual move out of build**:
   - Needs `confirmCancel` if an agent is active; the run is then cancelled.
   - Clears any gate, then calls `tick()` so dependents can unblock.
-- **Moving Done → Build** starts a **new cycle** (the UI asks for confirmation).
+- **Moving Done or PR Open → Build** starts a **new cycle** (the UI asks for confirmation). Moving to PR Open by hand needs a PR (409 otherwise).
 
 ## Run status (`AgentStatus`)
 
@@ -81,18 +90,20 @@ Any agent run that returns needs_clarification → [clarification gate] → answ
    - `afterValidated` (pipeline.ts:96), first match wins:
      1. `tester` on and no completed tester run in this cycle → `test/tester`. The tester runs at most once per cycle.
      2. `reviewer` on → `review/reviewer`.
-     3. Otherwise → `finish()`.
+     3. Otherwise → `beforeFinish()`.
+   Before 2: when a `preflight` run completed in this cycle → `finish()` (the reviewed code is not reviewed twice).
 7. **Reviewer**, first match wins:
-   1. Verdict is not `changes_requested` → `finish()`.
-   2. Review fixes are below `maxFixLoops` → `fix/developer` with `fixReason:'review'`.
+   1. Verdict is not `changes_requested` → `beforeFinish()`: run `preflight/developer` when `preflight` is on and none completed in this cycle, else `finish()`.
+   2. Review fixes are below `maxReviewLoops` → `fix/developer` with `fixReason:'review'`.
    3. `finalApproval` is on → `final_approval` gate with a note.
-   4. Otherwise → `stop`.
+   4. Otherwise → `stop` ("Needs a human: the reviewer still requests changes…").
 
 - `finish()` (pipeline.ts:105) → `final_approval` gate if `finalApproval`, otherwise `done`.
 - `stepLabel(kind, role, fixReason)` (pipeline.ts:111) gives "Planning", "Developing", "Fixing validation", "Addressing review", "Applying feedback", "Testing", "Reviewing", "Validating" or "Follow-up".
-- Fix loops are counted **per `fixReason` within the cycle**.
+- Fix loops are counted **per `fixReason` within the cycle**: validation against `maxFixLoops`, review against `maxReviewLoops`.
+- A clarification gate carries `options` (suggested answers per question) when the agent supplied them.
 
-Unit tests: `server/test/pipeline.unit.test.ts`.
+Unit tests: `server/test/pipeline.unit.test.ts`. The issue → PR flow around the pipeline: [issue-pr-workflow.md](issue-pr-workflow.md).
 
 ## Cycles
 
@@ -113,9 +124,9 @@ Unit tests: `server/test/pipeline.unit.test.ts`.
      - **`stop` with an error**: marks the run failed with the error ("Pipeline stopped") and notifies.
      - **`idle`**: nothing.
 - **`complete`** (line 751):
-  - Clears the gate, sets `agentStatus=completed` and moves the card to Done (top).
-  - Sends a success notification.
-  - If `autoCreatePr` is on, a token exists and there is no `prUrl` yet, it runs `createPrForFeature` asynchronously. Errors become an event and a notification.
+  - Clears the gate and sets `agentStatus=completed`.
+  - With `autoCreatePr` and a token: `createPrForFeature` (push, open or update the PR, human actions, move to PR Open). A failure becomes an error event and notification; the card stays in Build.
+  - Otherwise the card stays in Build with the activity "Ready for a pull request" and an attention notification; `continuePipeline` or "Create PR" picks it up.
 
 ## Gates: `resolveGate(featureId, action, {comment, answers})` (orchestrator.ts:122)
 
@@ -124,7 +135,7 @@ Unit tests: `server/test/pipeline.unit.test.ts`.
 | `plan_approval` | `approve` | Enqueue `feature/developer`; the comment becomes the run's `message` |
 | `plan_approval` | `reject` | Comment required. Enqueue `plan/planner` with the comment (a replan in the resumed session) |
 | `clarification` | `answer` | At least one non-blank answer required. `formatAnswers` builds the Q/A text; enqueue `answer` in `gate.role` |
-| `final_approval` | `approve` | `complete()` |
+| `final_approval` | `approve` | `complete()` (opens the PR) |
 | `final_approval` | `reject` | Comment required. Enqueue `fix/developer` with `fixReason:'user'` |
 
 Any other combination returns 400. `enqueueRun` always clears the gate.
@@ -152,6 +163,10 @@ Any other combination returns 400. `enqueueRun` always clears the gate.
 | Step failed | error |
 | Pipeline stopped | error |
 | Pipeline paused | error |
-| Feature done | success |
+| Ready for a pull request (no token / automatic PRs off) | attention |
+| PR opened with human actions open | attention |
+| PR merged | success |
+| PR closed without merging, CI failing | attention |
+| Decision cards waiting (backlog chat) | attention |
 | PR ready | success |
 | PR failed | error |

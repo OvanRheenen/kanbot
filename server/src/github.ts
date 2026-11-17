@@ -27,6 +27,18 @@ export function getToken(): { token: string; source: 'env' | 'file' } | null {
 
 let cachedLogin: string | null = null;
 
+/** Login of the token's user (cached after the first lookup). */
+export async function tokenLogin(): Promise<string | null> {
+  if (cachedLogin) return cachedLogin;
+  if (!getToken()) return null;
+  try {
+    cachedLogin = (await ghFetch<{ login: string }>('GET', '/user')).login;
+  } catch {
+    /* unknown */
+  }
+  return cachedLogin;
+}
+
 export function githubStatus(): GithubStatus {
   const t = getToken();
   return { configured: !!t, source: t?.source ?? null, login: t ? cachedLogin : null };
@@ -91,7 +103,7 @@ export async function ghFetch<T>(method: string, apiPath: string, body?: unknown
       Authorization: `Bearer ${t}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'local-ai-orchestrator',
+      'User-Agent': 'kanbot',
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
     },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -135,6 +147,7 @@ function gitWithToken(cwd: string, args: string[]): Promise<string> {
       {
         cwd,
         maxBuffer: 8 * 1024 * 1024,
+        timeout: 120000,
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...(token ? { GIT_ASKPASS: askpassScript(), ORCH_GIT_TOKEN: token } : {}) },
       },
       (err, stdout, stderr) => {
@@ -146,8 +159,14 @@ function gitWithToken(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+/** Fetch a branch from the remote into the repository's remote-tracking refs (shared by all worktrees). */
+export async function fetchBranch(cwd: string, remote: string, branch: string): Promise<void> {
+  await gitWithToken(cwd, ['fetch', '--no-tags', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`]);
+}
+
 export async function remoteUrl(cwd: string, remote: string): Promise<string> {
-  const url = (await git(cwd, ['remote', 'get-url', remote], { allowFail: true })).trim();
+  // The configured URL, not `remote get-url`: url.<x>.insteadOf rewrites (mirrors, tests) must not hide the GitHub repository.
+  const url = (await git(cwd, ['config', '--get', `remote.${remote}.url`], { allowFail: true })).trim();
   if (!url) throw new GithubError(400, `The repository has no remote named "${remote}". Set the remote in Project settings → Pipeline.`);
   return url;
 }
@@ -179,4 +198,74 @@ export async function createPullRequest(
   pr: { head: string; base: string; title: string; body: string; draft: boolean },
 ): Promise<PullRequest> {
   return ghFetch<PullRequest>('POST', `/repos/${r.owner}/${r.repo}/pulls`, pr, undefined, r.host);
+}
+
+export interface GhIssue {
+  number: number;
+  title: string;
+  body: string | null;
+  state: 'open' | 'closed';
+  html_url: string;
+  labels: (string | { name?: string })[];
+  pull_request?: unknown;
+  updated_at: string;
+}
+
+export const labelNames = (labels: GhIssue['labels'] | undefined): string[] =>
+  (labels ?? []).map((l) => (typeof l === 'string' ? l : l.name ?? '')).filter(Boolean);
+
+const repoPath = (r: RemoteRepo) => `/repos/${r.owner}/${r.repo}`;
+
+/** Open issues of the repository (pull requests excluded), newest first, up to `maxPages` × 100. */
+export async function listOpenIssues(r: RemoteRepo, maxPages = 5): Promise<GhIssue[]> {
+  const out: GhIssue[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await ghFetch<GhIssue[]>('GET', `${repoPath(r)}/issues?state=open&per_page=100&page=${page}`, undefined, undefined, r.host);
+    out.push(...batch.filter((i) => !i.pull_request));
+    if (batch.length < 100) break;
+  }
+  return out;
+}
+
+export const getIssue = (r: RemoteRepo, n: number) => ghFetch<GhIssue>('GET', `${repoPath(r)}/issues/${n}`, undefined, undefined, r.host);
+
+export const createIssue = (r: RemoteRepo, issue: { title: string; body: string; labels?: string[] }) =>
+  ghFetch<GhIssue>('POST', `${repoPath(r)}/issues`, issue, undefined, r.host);
+
+export const updateIssue = (r: RemoteRepo, n: number, patch: { title?: string; body?: string; labels?: string[]; state?: 'open' | 'closed' }) =>
+  ghFetch<GhIssue>('PATCH', `${repoPath(r)}/issues/${n}`, patch, undefined, r.host);
+
+export const commentOnIssue = (r: RemoteRepo, n: number, body: string) =>
+  ghFetch<{ id: number }>('POST', `${repoPath(r)}/issues/${n}/comments`, { body }, undefined, r.host);
+
+export const addAssignees = (r: RemoteRepo, n: number, assignees: string[]) =>
+  ghFetch<unknown>('POST', `${repoPath(r)}/issues/${n}/assignees`, { assignees }, undefined, r.host);
+
+export const requestReviewers = (r: RemoteRepo, n: number, reviewers: string[]) =>
+  ghFetch<unknown>('POST', `${repoPath(r)}/pulls/${n}/requested_reviewers`, { reviewers }, undefined, r.host);
+
+export interface GhPull {
+  number: number;
+  html_url: string;
+  state: 'open' | 'closed';
+  draft?: boolean;
+  merged?: boolean;
+  merged_at?: string | null;
+  labels?: GhIssue['labels'];
+  head?: { sha: string; ref: string };
+}
+
+export const getPull = (r: RemoteRepo, n: number) => ghFetch<GhPull>('GET', `${repoPath(r)}/pulls/${n}`, undefined, undefined, r.host);
+
+export const updatePull = (r: RemoteRepo, n: number, patch: { title?: string; body?: string }) =>
+  ghFetch<GhPull>('PATCH', `${repoPath(r)}/pulls/${n}`, patch, undefined, r.host);
+
+/** Combined result of the check runs on a commit: failing beats pending beats passing; null when there are none. */
+export async function checksState(r: RemoteRepo, sha: string): Promise<'pending' | 'passing' | 'failing' | null> {
+  const res = await ghFetch<{ check_runs?: { status: string; conclusion: string | null }[] }>('GET', `${repoPath(r)}/commits/${sha}/check-runs?per_page=100`, undefined, undefined, r.host);
+  const runs = res.check_runs ?? [];
+  if (!runs.length) return null;
+  if (runs.some((c) => c.status === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion ?? ''))) return 'failing';
+  if (runs.some((c) => c.status !== 'completed')) return 'pending';
+  return 'passing';
 }

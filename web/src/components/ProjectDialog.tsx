@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { CheckCircle2, XCircle } from 'lucide-react';
-import { CLAUDE_ROLES, type ClaudeRole, type PathValidation, type PipelineConfig, type Project, type RolesConfig } from '@shared/types.ts';
+import { CLAUDE_ROLES, ROLE_DEFAULT_MODEL, type ClaudeRole, type HumanActionRule, type PathValidation, type PipelineConfig, type Project, type RolesConfig } from '@shared/types.ts';
 import { api, type LaunchPreview } from '@/api';
 import { PROFILE_HELP } from './SettingsDialog';
 import { upsertProject, useStore } from '@/store';
@@ -12,26 +12,50 @@ import { CapabilitiesPicker } from './CapabilitiesPicker';
 
 const NO_TOOLS: string[] = [];
 
+const MIGRATION_RULE: HumanActionRule = {
+  pattern: 'supabase/migrations/**',
+  label: 'Migration',
+  detail: 'Run `supabase db push --linked`, then add the `migration-applied` label to the pull request. Agents never do either.',
+  doneLabel: 'migration-applied',
+};
+
+/** Mirrors the server's DEFAULT_PIPELINE (projects.ts): the issue → PR workflow. */
 export const DEFAULT_PIPELINE: PipelineConfig = {
   plan: true,
-  planApproval: true,
+  planApproval: false,
   validate: true,
   validationCommands: [],
-  tester: true,
-  reviewer: false,
+  tester: false,
+  reviewer: true,
   finalApproval: false,
   maxFixLoops: 2,
-  autoCreatePr: false,
-  prDraft: true,
+  maxReviewLoops: 5,
+  preflight: true,
+  postPlanToIssue: true,
+  assignPr: true,
+  prReviewers: [],
+  humanActionRules: [MIGRATION_RULE],
+  autoCreatePr: true,
+  prDraft: false,
   autoStart: null,
   remote: 'origin',
 };
 
+/** One rule per line: `path glob | tag | what the human does | PR label that marks it done (optional)`. */
+const rulesToText = (rules: HumanActionRule[]) => rules.map((r) => [r.pattern, r.label, r.detail, r.doneLabel].join(' | ').replace(/ \| $/, '')).join('\n');
+const textToRules = (text: string): HumanActionRule[] =>
+  text
+    .split('\n')
+    .map((line) => line.split('|').map((x) => x.trim()))
+    .filter((p) => p[0] && p[1])
+    .map(([pattern, label, detail = '', doneLabel = '']) => ({ pattern, label, detail, doneLabel }));
+
 const ROLE_HELP: Record<ClaudeRole, string> = {
-  planner: 'Read-only. Writes the implementation plan.',
-  developer: 'Implements the feature and fixes validation failures and review findings (same session as the planner).',
-  tester: 'Fresh session. Adds and runs tests for the feature.',
-  reviewer: 'Fresh, read-only session. Reviews the diff and requests changes.',
+  writer: 'Read-only, in the main checkout. Turns your idea into the GitHub issue in the Backlog chat.',
+  planner: 'Read-only. Writes the implementation plan from the issue.',
+  developer: 'Implements the ticket, fixes validation failures and review findings, and prepares the PR (same session as the planner).',
+  tester: 'Fresh session. Adds and runs tests for the ticket.',
+  reviewer: 'Fresh, read-only session. Reviews the diff and requests changes until there is nothing left.',
 };
 
 function Toggle({ checked, onChange, label, hint, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string; disabled?: boolean }) {
@@ -74,6 +98,8 @@ export function ProjectDialog({
   const globalAutoStart = useStore((s) => s.settings?.autoStartBuild ?? true);
   const [pipeline, setPipeline] = useState<PipelineConfig>(DEFAULT_PIPELINE);
   const [validationText, setValidationText] = useState('');
+  const [rulesText, setRulesText] = useState(rulesToText(DEFAULT_PIPELINE.humanActionRules));
+  const [reviewersText, setReviewersText] = useState('');
   const [detected, setDetected] = useState<{ commands: string[]; source: string } | null>(null);
   const [roles, setRoles] = useState<RolesConfig>({});
   const [previewRole, setPreviewRole] = useState<ClaudeRole>('developer');
@@ -98,6 +124,8 @@ export function ProjectDialog({
     setSkills(project?.skills ?? []);
     setPipeline(project?.pipeline ?? DEFAULT_PIPELINE);
     setValidationText((project?.pipeline.validationCommands ?? []).join('\n'));
+    setRulesText(rulesToText((project?.pipeline ?? DEFAULT_PIPELINE).humanActionRules));
+    setReviewersText((project?.pipeline.prReviewers ?? []).join(', '));
     setRoles(project?.roles ?? {});
     setDetected(null);
     setPreview(null);
@@ -142,7 +170,12 @@ export function ProjectDialog({
       mcpServers,
       skills,
       allowedTools: tools.split('\n').map((t) => t.trim()).filter(Boolean),
-      pipeline: { ...pipeline, validationCommands: validationText.split('\n').map((t) => t.trim()).filter(Boolean) },
+      pipeline: {
+        ...pipeline,
+        validationCommands: validationText.split('\n').map((t) => t.trim()).filter(Boolean),
+        humanActionRules: textToRules(rulesText),
+        prReviewers: reviewersText.split(/[\s,]+/).map((t) => t.trim().replace(/^@/, '')).filter(Boolean),
+      },
       roles,
     };
     try {
@@ -247,24 +280,36 @@ export function ProjectDialog({
           </details>
           <fieldset className="metal-surface space-y-3 rounded-xl p-3">
             <legend className="px-1 text-sm font-semibold">Pipeline</legend>
-            <p className="text-[11px] text-muted-foreground">What happens after a card enters Build. Every step runs in the feature&apos;s worktree; branches are never merged.</p>
-            <Field label="When a card enters Build" hint="Waiting cards show a ▶ button on the board. Follow-ups, retries and approvals always start right away.">
-              <Select
-                value={pipeline.autoStart === null ? '' : pipeline.autoStart ? 'auto' : 'manual'}
-                onChange={(e) => setP({ autoStart: e.target.value === '' ? null : e.target.value === 'auto' })}
-              >
-                <option value="">Use global setting (currently: {globalAutoStart ? 'start automatically' : 'wait for ▶'})</option>
-                <option value="auto">Start the agent automatically</option>
-                <option value="manual">Wait for ▶ Start</option>
-              </Select>
-            </Field>
+            <p className="text-[11px] text-muted-foreground">
+              What happens after a ticket enters Build. Every step runs in the ticket&apos;s own worktree, on its own branch from the fresh base branch. Agents never push, merge or apply migrations.
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="When a ticket enters Build" hint="Waiting cards show a ▶ button on the board.">
+                <Select
+                  value={pipeline.autoStart === null ? '' : pipeline.autoStart ? 'auto' : 'manual'}
+                  onChange={(e) => setP({ autoStart: e.target.value === '' ? null : e.target.value === 'auto' })}
+                >
+                  <option value="">Use global setting (currently: {globalAutoStart ? 'start planning' : 'wait for ▶'})</option>
+                  <option value="auto">Start planning automatically</option>
+                  <option value="manual">Wait for ▶ Start</option>
+                </Select>
+              </Field>
+              <Field label="After the plan" hint="Auto: the implementer starts as soon as the plan is written. Manual: you approve or comment on the plan first.">
+                <Select value={pipeline.planApproval ? 'manual' : 'auto'} disabled={!pipeline.plan} onChange={(e) => setP({ planApproval: e.target.value === 'manual' })}>
+                  <option value="auto">Implement automatically</option>
+                  <option value="manual">Wait for my approval</option>
+                </Select>
+              </Field>
+            </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-              <Toggle checked={pipeline.plan} onChange={(v) => setP({ plan: v })} label="1. Plan first" hint="A read-only planner writes an implementation plan." />
-              <Toggle checked={pipeline.planApproval} disabled={!pipeline.plan} onChange={(v) => setP({ planApproval: v })} label="Approve the plan" hint="Pause until you approve or comment on the plan." />
-              <Toggle checked={pipeline.validate} onChange={(v) => setP({ validate: v })} label="2. Validate" hint="Kanbuild runs the commands below after each code change; failures go back to the developer." />
-              <Toggle checked={pipeline.tester} onChange={(v) => setP({ tester: v })} label="3. Tester agent" hint="A separate agent adds and runs tests." />
-              <Toggle checked={pipeline.reviewer} onChange={(v) => setP({ reviewer: v })} label="4. Reviewer agent" hint="A read-only agent reviews the diff; requested changes go back to the developer." />
-              <Toggle checked={pipeline.finalApproval} onChange={(v) => setP({ finalApproval: v })} label="5. Final approval" hint="Pause before Done so you can review the diff." />
+              <Toggle checked={pipeline.plan} onChange={(v) => setP({ plan: v })} label="1. Plan" hint="The planner reads the issue and the code and writes the plan. Nothing is changed yet." />
+              <Toggle checked={pipeline.postPlanToIssue} disabled={!pipeline.plan} onChange={(v) => setP({ postPlanToIssue: v })} label="Post the plan on the issue" hint="As a comment on the GitHub issue." />
+              <Toggle checked={pipeline.validate} onChange={(v) => setP({ validate: v })} label="2. Validate" hint="Kanbot runs the commands below after each code change; failures go back to the implementer." />
+              <Toggle checked={pipeline.tester} onChange={(v) => setP({ tester: v })} label="Tester agent" hint="A separate agent adds and runs tests. Off: the implementer writes them." />
+              <Toggle checked={pipeline.reviewer} onChange={(v) => setP({ reviewer: v })} label="3. Review loop" hint="The reviewer reads the diff; the implementer fixes its findings; repeat until nothing is left." />
+              <Toggle checked={pipeline.preflight} onChange={(v) => setP({ preflight: v })} label="4. PR preflight" hint="Merge the base branch, run the tests the change needs, update docs, fill in the PR template. Uses the repo's pr-preflight skill when it has one." />
+              <Toggle checked={pipeline.finalApproval} onChange={(v) => setP({ finalApproval: v })} label="Final approval" hint="Pause before the pull request is opened so you can read the diff." />
+              <Toggle checked={pipeline.autoCreatePr} onChange={(v) => setP({ autoCreatePr: v })} label="5. Open the pull request" hint="Push the branch, open the PR and move the card to PR Open. Off: the card waits for Create PR." />
             </div>
             {pipeline.validate && (
               <Field
@@ -277,35 +322,49 @@ export function ProjectDialog({
                     : 'Empty = auto-detect from package.json, Cargo.toml or go.mod.'
                 }
               >
-                <Textarea value={validationText} onChange={(e) => setValidationText(e.target.value)} rows={3} className="font-mono text-xs" placeholder={detected?.commands.join('\n') || 'npm test'} />
+                <Textarea value={validationText} onChange={(e) => setValidationText(e.target.value)} rows={3} className="font-mono text-xs" placeholder={detected?.commands.join('\n') || 'pnpm lint\npnpm typecheck\npnpm test'} />
               </Field>
             )}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <Field label="Max automatic fix rounds" hint="Per reason (validation, review).">
+              <Field label="Max review rounds" hint="Then the card is flagged for you.">
+                <Input type="number" min={0} max={10} value={pipeline.maxReviewLoops} onChange={(e) => setP({ maxReviewLoops: Number(e.target.value) })} />
+              </Field>
+              <Field label="Max validation fixes" hint="Automatic fix rounds.">
                 <Input type="number" min={0} max={5} value={pipeline.maxFixLoops} onChange={(e) => setP({ maxFixLoops: Number(e.target.value) })} />
               </Field>
-              <Field label="Git remote" hint="For pull requests.">
+              <Field label="Git remote" hint="The GitHub repository.">
                 <Input value={pipeline.remote} onChange={(e) => setP({ remote: e.target.value })} className="font-mono text-xs" />
+              </Field>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_auto]">
+              <Field label="PR reviewers (GitHub logins)" hint="Empty = you. GitHub does not let a PR's author be its reviewer, so with your own token the PR is assigned to you instead.">
+                <Input value={reviewersText} onChange={(e) => setReviewersText(e.target.value)} placeholder="you" disabled={!pipeline.assignPr} className="font-mono text-xs" />
               </Field>
               <div className="space-y-2 pt-5">
                 <label className="flex items-center gap-2 text-xs">
-                  <input type="checkbox" checked={pipeline.prDraft} onChange={(e) => setP({ prDraft: e.target.checked })} /> Draft pull requests
+                  <input type="checkbox" checked={pipeline.assignPr} onChange={(e) => setP({ assignPr: e.target.checked })} /> Assign the PR to me and request review
                 </label>
                 <label className="flex items-center gap-2 text-xs">
-                  <input type="checkbox" checked={pipeline.autoCreatePr} onChange={(e) => setP({ autoCreatePr: e.target.checked })} /> Open a PR automatically when Done
+                  <input type="checkbox" checked={pipeline.prDraft} onChange={(e) => setP({ prDraft: e.target.checked })} /> Open pull requests as drafts
                 </label>
               </div>
             </div>
+            <Field
+              label="Human-action rules (one per line)"
+              hint="path glob | tag | what you have to do | PR label that marks it done (optional). A pull request that touches a matching path gets the tag on its card and in its description."
+            >
+              <Textarea value={rulesText} onChange={(e) => setRulesText(e.target.value)} rows={3} className="font-mono text-xs" placeholder="supabase/migrations/** | Migration | Run supabase db push --linked | migration-applied" />
+            </Field>
           </fieldset>
           <fieldset className="metal-surface space-y-2 rounded-xl p-3">
             <legend className="px-1 text-sm font-semibold">Agent roles</legend>
-            <p className="text-[11px] text-muted-foreground">Optional model and effort per role (empty = the project/global setting). A cheaper model often works well for review.</p>
+            <p className="text-[11px] text-muted-foreground">Model and effort per role. Empty = the project or global model if one is set, else the default shown.</p>
             {CLAUDE_ROLES.map((role) => (
               <div key={role} className="grid grid-cols-[6rem_1fr_8rem] items-center gap-2">
                 <span className="text-sm font-medium capitalize" title={ROLE_HELP[role]}>
                   {role}
                 </span>
-                <Input value={roles[role]?.model ?? ''} onChange={(e) => setRole(role, { model: e.target.value })} placeholder={model || 'model: inherit'} className="h-8 font-mono text-xs" />
+                <Input value={roles[role]?.model ?? ''} onChange={(e) => setRole(role, { model: e.target.value })} placeholder={model || ROLE_DEFAULT_MODEL[role]} className="h-8 font-mono text-xs" />
                 <Select value={roles[role]?.effort ?? ''} onChange={(e) => setRole(role, { effort: e.target.value })} className="h-8 text-xs">
                   <option value="">effort: inherit</option>
                   {['low', 'medium', 'high', 'xhigh', 'max'].map((x) => (

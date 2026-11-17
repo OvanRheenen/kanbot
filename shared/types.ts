@@ -4,10 +4,11 @@
  * Bumped whenever the backend and the dashboard must be updated together. The dashboard shows a
  * "rebuild/reload" banner when its compiled value differs from the backend's.
  */
-export const API_VERSION = 9;
+export const API_VERSION = 10;
 
 export type Priority = 'low' | 'medium' | 'high';
-export type FeatureStatus = 'backlog' | 'build' | 'done';
+export type FeatureStatus = 'backlog' | 'build' | 'pr_open' | 'done';
+export const FEATURE_STATUSES: FeatureStatus[] = ['backlog', 'build', 'pr_open', 'done'];
 export type AgentStatus =
   | 'queued'
   | 'initialising'
@@ -29,11 +30,15 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
  *  validate  the orchestrator runs the project's validation commands (no agent)
  *  answer    an agent continues after the user answered its clarification questions
  *  followup  the user asked for more work on a finished feature
+ *  refine    backlog chat: the writer agent turns an idea into a GitHub issue (read-only, runs in the main checkout)
+ *  preflight developer prepares the pull request: merge the base branch, pick tests, update docs, write the PR body
  */
-export type RunKind = 'plan' | 'feature' | 'fix' | 'test' | 'review' | 'validate' | 'answer' | 'followup';
-export type AgentRole = 'planner' | 'developer' | 'tester' | 'reviewer' | 'validator';
+export type RunKind = 'plan' | 'feature' | 'fix' | 'test' | 'review' | 'validate' | 'answer' | 'followup' | 'refine' | 'preflight';
+export type AgentRole = 'planner' | 'developer' | 'tester' | 'reviewer' | 'validator' | 'writer';
 export type ClaudeRole = Exclude<AgentRole, 'validator'>;
-export const CLAUDE_ROLES: ClaudeRole[] = ['planner', 'developer', 'tester', 'reviewer'];
+export const CLAUDE_ROLES: ClaudeRole[] = ['writer', 'planner', 'developer', 'tester', 'reviewer'];
+/** Model used by a role when neither the role, the project nor the global settings name one. */
+export const ROLE_DEFAULT_MODEL: Record<ClaudeRole, string> = { writer: 'opus', planner: 'opus', developer: 'sonnet', tester: 'sonnet', reviewer: 'opus' };
 export type FixReason = 'validation' | 'review' | 'user';
 
 export interface PipelineConfig {
@@ -51,8 +56,20 @@ export interface PipelineConfig {
   reviewer: boolean;
   /** Pause for user approval before the feature is marked Done. */
   finalApproval: boolean;
-  /** Max automatic fix rounds per reason (validation failures, review findings). */
+  /** Max automatic fix rounds for validation failures. */
   maxFixLoops: number;
+  /** Max review → fix rounds before the pipeline stops and asks for a human. */
+  maxReviewLoops: number;
+  /** Developer runs the PR preflight (merge base, tests by what changed, docs, PR body) before the PR is opened. */
+  preflight: boolean;
+  /** Post the planner's plan as a comment on the GitHub issue. */
+  postPlanToIssue: boolean;
+  /** Assign the PR to the token's user and request a review. */
+  assignPr: boolean;
+  /** GitHub logins asked to review the PR. Empty = the token's user. */
+  prReviewers: string[];
+  /** Changed paths that need a human step before merging (e.g. database migrations). */
+  humanActionRules: HumanActionRule[];
   /** Create a GitHub pull request automatically when the pipeline completes. */
   autoCreatePr: boolean;
   prDraft: boolean;
@@ -69,6 +86,65 @@ export interface RoleConfig {
 }
 export type RolesConfig = Partial<Record<ClaudeRole, RoleConfig>>;
 
+export interface HumanActionRule {
+  /** Glob on repository-relative paths (`*` = within a folder, `**` = any depth). */
+  pattern: string;
+  label: string;
+  /** What the human has to do. */
+  detail: string;
+  /** PR label that marks the step as done (e.g. `migration-applied`). '' = tick it off on the board. */
+  doneLabel: string;
+}
+
+/** A step only a human may take before the PR can merge. Shown as a tag on the card. */
+export interface HumanAction {
+  id: string;
+  source: 'rule' | 'agent' | 'tests' | 'github';
+  label: string;
+  detail: string;
+  done: boolean;
+}
+
+/** State of the ticket's pull request, refreshed by the GitHub sync. */
+export interface PrInfo {
+  state: 'open' | 'closed' | 'merged';
+  draft: boolean;
+  checks: 'pending' | 'passing' | 'failing' | null;
+  labels: string[];
+  syncedAt: string;
+}
+
+/** One open choice the writer agent wants the user to make. */
+export interface DecisionCard {
+  id: string;
+  question: string;
+  options: { label: string; description: string }[];
+  /** The user's choice (an option label or free text); null while open. */
+  answer: string | null;
+}
+
+/** The issue the writer agent drafted in the backlog chat. */
+export interface IssueDraft {
+  title: string;
+  body: string;
+  labels: string[];
+  size: string;
+  /** Issue numbers this ticket depends on. */
+  dependsOn: number[];
+  /** True once no decision is open and the draft may be published. */
+  ready: boolean;
+}
+
+export interface ChatMessage {
+  id: string;
+  featureId: string;
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+  decisions: DecisionCard[];
+  runId: string | null;
+  createdAt: string;
+}
+
 export type GateType = 'plan_approval' | 'clarification' | 'final_approval';
 export interface Gate {
   type: GateType;
@@ -79,6 +155,8 @@ export interface Gate {
   plan?: string;
   /** clarification: questions from the agent. */
   questions?: string[];
+  /** clarification: suggested answers per question (decision cards); an empty list = free text only. */
+  options?: string[][];
   /** clarification: role of the agent that asked. */
   role?: AgentRole;
   /** final_approval: short context (e.g. review still requesting changes). */
@@ -128,6 +206,8 @@ export interface Project {
   /** Overrides; empty string = inherit global setting. */
   agentProfile: AgentProfile | '';
   effort: Effort | '';
+  /** `owner/repo` on GitHub, resolved from the remote ('' until the first sync). */
+  repoSlug: string;
   /** Optional MCP config (JSON string or file path) passed via --mcp-config. */
   mcpConfig: string;
   /** MCP servers (names from the catalog) the project's agents may use. Empty = profile default. */
@@ -200,6 +280,20 @@ export interface Feature {
   baseRef: string | null;
   prUrl: string | null;
   prNumber: number | null;
+  /** GitHub issue behind this ticket (null while it is still a local draft). */
+  issueNumber: number | null;
+  issueUrl: string | null;
+  issueState: 'open' | 'closed' | null;
+  labels: string[];
+  /** T-shirt size from the issue's labels or body. */
+  size: string | null;
+  /** Steps only a human may take (migrations, tests that need Docker, …). */
+  humanActions: HumanAction[];
+  pr: PrInfo | null;
+  /** Latest issue draft from the backlog chat. */
+  draft: IssueDraft | null;
+  /** Decision cards in the backlog chat that still need an answer. */
+  openDecisions: number;
   /** Sums over all runs of the feature (pipelines run several agents). */
   totals?: { runs: number; costUsd: number; newTokens: number };
   createdAt: string;
@@ -335,6 +429,16 @@ export interface AgentSelfReport {
   plan: string;
   /** Questions the agent needs answered before it can continue. */
   needsClarification: string[];
+  /** Suggested answers per question (same order as needsClarification). */
+  clarificationOptions: string[][];
+  /** Writer: chat reply, open decisions and the issue draft. */
+  reply: string;
+  decisions: Omit<DecisionCard, 'answer'>[];
+  issue: IssueDraft | null;
+  /** Preflight: pull request title and body, and manual steps the human must take before merging. */
+  prTitle: string;
+  prBody: string;
+  humanActions: { label: string; detail: string }[];
   /** Reviewer: verdict and findings. */
   review: ReviewResult | null;
   reported: boolean;
@@ -374,6 +478,8 @@ export interface Settings {
   systemNotifications: boolean;
   /** Start the agent when a card is moved into Build. Off: cards wait in Build for an explicit start. Projects can override. */
   autoStartBuild: boolean;
+  /** Seconds between GitHub syncs (issues in, PR state). 0 = manual sync only. */
+  syncIntervalSec: number;
 }
 
 export interface GithubStatus {
@@ -440,6 +546,7 @@ export type ServerMessage =
   | { type: 'project.deleted'; projectId: string }
   | { type: 'settings.updated'; settings: Settings }
   | { type: 'notification'; notification: AppNotification }
+  | { type: 'chat.message'; message: ChatMessage }
   | { type: 'terminal.updated'; session: TerminalSession }
   | { type: 'terminal.output'; sessionId: string; featureId: string; offset: number; chunk: string };
 

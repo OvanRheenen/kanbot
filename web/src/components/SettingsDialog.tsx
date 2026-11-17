@@ -31,6 +31,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   const [notifications, setNotifications] = useState<'all' | 'attention' | 'off'>('all');
   const [systemNotifications, setSystemNotifications] = useState(false);
   const [autoStartBuild, setAutoStartBuild] = useState(true);
+  const [syncIntervalSec, setSyncIntervalSec] = useState(60);
   const [permission, setPermission] = useState(browserPermission());
   const [github, setGithub] = useState<(GithubStatus & { error?: string }) | null>(null);
   const [token, setToken] = useState('');
@@ -53,6 +54,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
       setNotifications(settings.notifications);
       setSystemNotifications(settings.systemNotifications);
       setAutoStartBuild(settings.autoStartBuild ?? true);
+      setSyncIntervalSec(settings.syncIntervalSec ?? 60);
       setPermission(browserPermission());
     }
   }, [open, settings]);
@@ -91,7 +93,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
     e.preventDefault();
     try {
       const editorCommand = editorPreset === 'custom' ? customEditor.trim() : editorPreset;
-      setSettings(await api.updateSettings({ concurrency, agentProfile, effort, maxBudgetUsd, defaultModel, editorCommand, claudeBinary, notifications, systemNotifications, autoStartBuild }));
+      setSettings(await api.updateSettings({ concurrency, agentProfile, effort, maxBudgetUsd, defaultModel, editorCommand, claudeBinary, notifications, systemNotifications, autoStartBuild, syncIntervalSec }));
       onOpenChange(false);
     } catch (err) {
       toastError(err);
@@ -209,7 +211,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
                 )}
               </div>
             ) : (
-              <p className="text-xs text-muted-foreground">Not connected. Add a token to create pull requests.</p>
+              <p className="text-xs text-muted-foreground">Not connected. Add a personal access token to sync issues and open pull requests.</p>
             )}
             <div className="flex gap-2">
               <Input type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} placeholder="github_pat_… or ghp_…" className="font-mono text-xs" />
@@ -217,9 +219,14 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
                 {savingToken ? 'Checking…' : github?.configured ? 'Replace' : 'Save token'}
               </Button>
             </div>
+            <label className="flex items-center gap-2 text-xs">
+              Sync issues and pull requests every
+              <Input type="number" min={0} max={3600} value={syncIntervalSec} onChange={(e) => setSyncIntervalSec(Number(e.target.value))} className="h-7 w-20" />
+              seconds (0 = only when you click Sync)
+            </label>
             {tokenError && <p className="text-xs text-red-600">Not saved: {tokenError}</p>}
             <p className="text-[11px] text-muted-foreground">
-              Fine-grained token with <strong>Contents: read &amp; write</strong> and <strong>Pull requests: read &amp; write</strong> on your repositories. It is validated, never shown again, never passed to agents, and only used to push feature branches and open pull requests. Nothing is ever merged.
+              Fine-grained token with <strong>Contents</strong>, <strong>Issues</strong> and <strong>Pull requests: read &amp; write</strong>, plus <strong>Checks</strong> or <strong>Commit statuses: read</strong> for the CI tag, on your repositories (classic token: <code>repo</code>). It is validated, never shown again, never passed to agents, and only used to push feature branches and open pull requests. Nothing is ever merged.
             </p>
           </fieldset>
           <DialogFooter>

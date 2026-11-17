@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Coins, FolderGit2, LayoutGrid, Monitor, Moon, MoveRight, Plus, Settings, SlidersHorizontal, Sun, Trash2 } from 'lucide-react';
+import { ArrowRight, Coins, FolderGit2, Github, LayoutGrid, RefreshCw, Monitor, Moon, MoveRight, Plus, Settings, SlidersHorizontal, Sun, Trash2 } from 'lucide-react';
 import { API_VERSION, type Feature, type Project } from '@shared/types.ts';
 import { api } from './api';
 import { getState, loadFeatures, onNotification, useStore } from './store';
@@ -133,10 +133,26 @@ export default function App() {
     [features, projectId],
   );
 
+  const githubConfigured = useStore((s) => !!s.settings?.github?.configured);
+  const [syncing, setSyncing] = useState(false);
+  const syncNow = async () => {
+    if (!projectId) return;
+    setSyncing(true);
+    try {
+      const r = await api.sync(projectId);
+      const parts = [r.imported && `${r.imported} imported`, r.updated && `${r.updated} updated`, r.closed && `${r.closed} closed`, r.merged && `${r.merged} merged`].filter(Boolean);
+      toast(parts.length ? `Synced with ${r.repo}: ${parts.join(', ')}` : `Up to date with ${r.repo}`);
+    } catch (err) {
+      toastError(err);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const removeProject = async (p: Project) => {
     const ok = await confirm({
       title: `Remove "${p.name}" from the dashboard?`,
-      description: 'Its board and execution history are removed from Kanbuild. The repository, branches and worktrees on disk are NOT deleted.',
+      description: 'Its board and execution history are removed from Kanbot. The repository, branches and worktrees on disk are NOT deleted.',
       confirmLabel: 'Remove project',
       destructive: true,
     });
@@ -156,7 +172,7 @@ export default function App() {
         <div className="flex items-center gap-2.5 px-4 pb-3 pt-4">
           <Logo />
           <div className="min-w-0">
-            <div className="chrome-text text-sm font-semibold leading-tight tracking-tight">Kanbuild</div>
+            <div className="chrome-text text-sm font-semibold leading-tight tracking-tight">Kanbot</div>
             <div className="mt-0.5 inline-flex items-center gap-1.5 text-[10px] text-muted-foreground">
               <span className={cn('h-1.5 w-1.5 rounded-full', connected ? 'bg-emerald-500 shadow-[0_0_6px_hsl(152_80%_45%)]' : 'animate-pulse bg-red-500')} />
               {connected ? 'local backend connected' : 'reconnecting…'}
@@ -182,7 +198,7 @@ export default function App() {
               <FolderGit2 className={cn('h-4 w-4 shrink-0', p.id === projectId && 'text-primary')} />
               <span className="min-w-0 flex-1 truncate">{p.name}</span>
               {counts[p.id]?.attention ? (
-                <span className="metal-gold rounded-full px-1.5 text-[10px] font-semibold" title={`${counts[p.id].attention} feature(s) waiting for you`}>
+                <span className="metal-gold rounded-full px-1.5 text-[10px] font-semibold" title={`${counts[p.id].attention} ticket(s) waiting for you`}>
                   {counts[p.id].attention} waiting
                 </span>
               ) : null}
@@ -243,11 +259,30 @@ export default function App() {
                     <Coins className="h-3.5 w-3.5" /> est. ~{formatCost(projectCost)}
                   </span>
                 )}
+                {project.repoSlug && (
+                  <a
+                    href={`https://github.com/${project.repoSlug}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="hidden items-center gap-1 font-mono text-[11px] text-muted-foreground hover:text-foreground lg:inline-flex"
+                  >
+                    <Github className="h-3.5 w-3.5" /> {project.repoSlug}
+                  </a>
+                )}
+                <Button
+                  variant="chrome"
+                  size="sm"
+                  disabled={syncing || !githubConfigured}
+                  onClick={syncNow}
+                  title={githubConfigured ? 'Pull issues and pull request state from GitHub now' : 'Add a GitHub token in Settings first'}
+                >
+                  <RefreshCw className={cn(syncing && 'animate-spin')} /> Sync
+                </Button>
                 <Button variant="chrome" size="sm" onClick={() => setProjectDialog({ open: true, project })}>
                   <SlidersHorizontal /> Project settings
                 </Button>
                 <Button size="sm" onClick={() => setFeatureDialog({ open: true, feature: null })}>
-                  <Plus /> New feature
+                  <Plus /> New ticket
                 </Button>
               </div>
             </header>
@@ -269,7 +304,7 @@ export default function App() {
                 <div>
                   <h2 className="text-sm font-semibold">Register your first project</h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    Point Kanbuild at an existing local Git repository. Each feature you move into Build gets its own branch, worktree and Claude Code agent.
+                    Point Kanbot at a local clone of a GitHub repository. Its open issues become the Backlog; each ticket you move into Build gets its own branch, worktree and agents, and ends as a pull request.
                   </p>
                 </div>
               </div>

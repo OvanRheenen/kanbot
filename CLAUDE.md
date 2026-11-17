@@ -14,22 +14,22 @@
 
 ## What this app is
 
-**Kanbuild** (formerly Local AI Orchestrator; package `local-ai-orchestrator`) is a local-first Kanban board.
-You register git repos as *projects* and add *feature* cards. Dragging a card into **Build**
-runs headless Claude Code agents (`claude -p --output-format stream-json`) in an isolated
-git worktree and branch. They run through a configurable pipeline:
-plan → approve plan → develop → validate ⇄ fix → test → review ⇄ fix → final approval → Done → (optional) GitHub PR.
-The dashboard streams progress, tokens and cost estimates, diffs and reports live, and has a per-feature Terminal tab that runs commands in the worktree. Branches are never merged automatically.
-It ships two ways: the web version (`npm start` + browser) and a **macOS app** (Electron, `desktop/`) that runs the same backend. MIT licensed.
+**Kanbot** is a fork of [Kanbuild](https://github.com/kanbuild/kanbuild) (MIT): a local-first Kanban board where every ticket
+is a GitHub issue. Columns: **Backlog → Build → PR Open → Done**. In the Backlog a writer agent drafts the issue with
+the user in a chat (decision cards for open choices). Dragging a ticket into **Build** runs headless Claude Code agents
+(`claude -p --output-format stream-json`) in the ticket's own git worktree, branched from the fresh base branch:
+plan (Opus) → implement (Sonnet) → validate ⇄ fix → review (Opus) ⇄ fix until approved → PR preflight → open the PR → PR Open.
+Human-only steps (migrations, tests that need Docker) become tags on the card. A merged PR moves the card to Done.
+Agents never push, merge or apply migrations; the orchestrator pushes and opens the PR, the human merges.
+Full flow: [docs/issue-pr-workflow.md](docs/issue-pr-workflow.md). Kanbuild's Electron app was removed; this is web only.
 
 Monorepo layout (npm workspaces, Node ≥ 22.13 for `node:sqlite`):
 
 | Path | What |
 |---|---|
 | `server/src/` | Express + ws backend, run directly with tsx (no build). Orchestrator, pipeline, agent runner, git, GitHub, SQLite |
-| `server/test/` | vitest suites + `fixtures/fake-claude.mjs` (a fake `claude` CLI) |
+| `server/test/` | vitest suites + `fixtures/fake-claude.mjs` (a fake `claude` CLI) and `fixtures/fake-github.mjs` (a fake GitHub API) |
 | `web/src/` | Vite + React 18 + Tailwind dashboard (shadcn-style UI, custom store, no router) |
-| `desktop/` | Electron macOS app: `src/main.ts` spawns or reuses the backend and opens a window. Packaging, signing |
 | `shared/types.ts` | Types shared by server and web, `API_VERSION`, WebSocket `ServerMessage` union |
 | `docs/` | **The documentation. Read this instead of code.** |
 
@@ -39,37 +39,37 @@ Monorepo layout (npm workspaces, Node ≥ 22.13 for `node:sqlite`):
 npm install                 # once
 npm run dev                 # server :4317 (tsx watch) + Vite :5173 (proxies /api, /ws)
 npm start                   # build web, then serve everything on http://127.0.0.1:4317
-npm test                    # server + desktop vitest suites (needs git on PATH)
-npm run typecheck           # tsc --noEmit for server, web and desktop
+npm test                    # server vitest suites (needs git on PATH)
+npm run typecheck           # tsc --noEmit for server and web
 npm run build               # vite build -> web/dist
 cd server && npx vitest run test/pipeline.test.ts   # a single test file
 ORCH_CLAUDE_BIN=$PWD/server/test/fixtures/fake-claude.mjs npm start   # UI demo, no tokens spent
-npm run desktop:dev         # Mac app from source (Electron); desktop:dist packages the .dmg (macOS only)
+node server/test/fixtures/fake-github.mjs 4999 &                       # fake GitHub for demos (ORCH_GITHUB_API_URL)
 ```
 
 ## Documentation index
 
 | Doc | Read it when you need… |
 |---|---|
+| [docs/issue-pr-workflow.md](docs/issue-pr-workflow.md) | **Start here for Kanbot's additions:** backlog chat, issue sync, PR Open/Done, human actions, preflight |
 | [docs/architecture.md](docs/architecture.md) | Process model, data flow, data dir layout, **env vars**, startup/recovery, ports |
 | [docs/data-model.md](docs/data-model.md) | SQLite schema, migrations, `shared/types.ts` types and enums, IDs, positions |
 | [docs/api.md](docs/api.md) | Every REST endpoint, error conventions, WebSocket messages, localhost guard |
 | [docs/pipeline.md](docs/pipeline.md) | Feature and run state machines, `nextStep` rules, cycles, fix loops, gates, retry/continue/follow-up/cancel |
 | [docs/orchestrator-and-agents.md](docs/orchestrator-and-agents.md) | Scheduling (`tick`), prompt and session choice per run kind, detached runner, child env, stall watchdog, CLI flags (`launch.ts`), stream parser |
 | [docs/prompts-and-reports.md](docs/prompts-and-reports.md) | Prompt builders, role markers, report JSON schemas, test-hang rules, `@file` refs, self-report parsing, markdown reports |
-| [docs/git-worktrees-validation.md](docs/git-worktrees-validation.md) | Branch and worktree naming, changes and diffs, diff parser, dependency stacking, validation command detection and running, Terminal command runner |
+| [docs/git-worktrees-validation.md](docs/git-worktrees-validation.md) | Branch and worktree naming, changes and diffs, diff parser, fresh-base branching (no stacking), validation command detection and running, Terminal command runner |
 | [docs/github-prs.md](docs/github-prs.md) | GitHub token, authenticated push, remote parsing, PR creation flow and PR body |
 | [docs/capabilities-catalog.md](docs/capabilities-catalog.md) | MCP server and skill discovery, redaction, per-run MCP config and skills plugin, allow/deny rules |
 | [docs/settings-projects-features.md](docs/settings-projects-features.md) | Global settings, project config and defaults, feature CRUD and moves, dependencies, editor, notifications, pricing |
 | [docs/web-dashboard.md](docs/web-dashboard.md) | Frontend stack, store, WebSocket client, API client, every component, styling, UI gotchas |
-| [docs/desktop-app.md](docs/desktop-app.md) | macOS app: launch/reuse logic, PATH resolution, bundled Node, packaging, signing/notarization, releases |
 | [docs/testing.md](docs/testing.md) | How tests are structured and run, isolation pattern, fake-claude knobs, what each suite covers |
 
 ## Critical invariants (don't break these)
 
 - **Migrations are append-only.** Never edit an entry in `MIGRATIONS` (`server/src/db.ts`); append a new one.
-  The current schema version is 5. Update `docs/data-model.md`.
-- **Bump `API_VERSION`** (`shared/types.ts`, now 9) whenever the backend and dashboard must change together.
+  The current schema version is 6. Update `docs/data-model.md`.
+- **Bump `API_VERSION`** (`shared/types.ts`, now 10) whenever the backend and dashboard must change together.
   The UI shows a reload banner on a mismatch.
 - **Imports use explicit `.ts` extensions** (`allowImportingTsExtensions`). Shared types are imported as `@shared/types.ts` in web.
 - **The pipeline is a pure function of the DB** (`pipeline.ts` `nextStep` over the cycle's runs and stored reports).
@@ -78,7 +78,11 @@ npm run desktop:dev         # Mac app from source (Electron); desktop:dist packa
 - **Child env hygiene:** `childEnv()` (`runner.ts`) strips `NODE_ENV`, Claude session vars, GitHub tokens and the
   server's own `NODE_OPTIONS`. Use it for any new child process (agent or validation).
 - **Never** pass `--dangerously-skip-permissions`. Never force-push, merge, or delete branches or worktrees automatically.
-- **Planner and reviewer are read-only roles** (permission mode `default`, Edit/Write disallowed).
+- **Writer, planner and reviewer are read-only roles** (permission mode `default`, Edit/Write disallowed).
+- **Agents never touch GitHub or remote databases.** `ALWAYS_DENIED` (`launch.ts`) blocks `git push`, `gh` and
+  `supabase db push` for every role; keep new prompts consistent with `HARD_RULES` (`prompt.ts`).
+- **One ticket = one branch = one PR**, from the fresh base branch. Never stack branches; dependencies wait until Done.
+- **GitHub is the source of truth for ticket text.** Board edits go to the issue; a sync overwrites with GitHub's text.
 - **Localhost only:** non-local `Host` or `Origin` gets a 403, and the WS upgrade is destroyed.
 - **React:** hooks must run unconditionally (a past conditional `useStore` blanked the dashboard).
   Store selectors must return stable references (no fresh `[]` or `{}`).
@@ -97,7 +101,7 @@ npm run desktop:dev         # Mac app from source (Electron); desktop:dist packa
   `RunKind`/labels in `shared/types.ts` and `web/src/components/status.tsx`, and `PipelineTab.tsx` steps.
 - UI: shadcn-style primitives in `web/src/components/ui/`, `cn()` from `lib/utils.ts`, `confirm()` and `toast()` helpers.
 - Commit messages: short imperative summary.
-- The Mac app must stay a thin shell: features go in server/web so both versions get them. Backend-only paths come from env (`ORCH_WEB_DIST`).
+- Credit upstream: keep Kanbuild's copyright line in `LICENSE` and the Credits section in `README.md`.
 
 ## Docs maintenance checklist (run after every change)
 

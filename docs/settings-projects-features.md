@@ -153,3 +153,13 @@ To add a setting:
 - **Validator runs** cost $0.
 - **Feature totals** sum all runs.
 - **UI:** "est." labels. "New tokens" excludes cache reads.
+
+## Added by Kanbot (see [issue-pr-workflow.md](issue-pr-workflow.md))
+
+- **Settings:** `syncIntervalSec` (default 60, clamped to 20-3600, 0 = manual sync only).
+- **Project:** `repoSlug` (`owner/repo`, set by the first sync or PR). New pipeline fields and defaults are listed in
+  [pipeline.md](pipeline.md). `cleanPipeline` validates `humanActionRules` (pattern and label required, at most 30) and
+  `prReviewers` (GitHub logins, at most 10). `DEFAULT_ALLOWED_TOOLS` adds `git merge`, `git mv`, `git rm`, `git restore`.
+- **Features:** `sizeOf`, `dependsOnIssues`, `findByIssue`, `setDependenciesByIssue`, `blankFeature` and the issue, PR,
+  draft and human-action columns in `features.ts`. Dependencies block a ticket until they are **Done** (merged).
+- The data directory is `~/.kanbot` (Kanbuild's `~/.local-orchestrator` is not read).

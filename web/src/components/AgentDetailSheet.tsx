@@ -30,6 +30,7 @@ import {
   SquareTerminal,
   Trash2,
   Wrench,
+  MessagesSquare,
 } from 'lucide-react';
 import type { Changes, Feature, Report, ReviewResult, Run, RunEvent } from '@shared/types.ts';
 import { api, ApiError, type SessionInfo } from '@/api';
@@ -45,6 +46,9 @@ import { DiffViewer } from './DiffViewer';
 import { Chip } from './ui/chip';
 import { Composer, composerTextareaClass, type ComposerSuggestion } from './ui/composer';
 import { GatePanel } from './GatePanel';
+import { HumanActionsPanel, TicketPanel } from './TicketPanel';
+
+const COLUMN_LABEL = { backlog: 'Backlog', build: 'Build', pr_open: 'PR Open', done: 'Done' } as const;
 import { PipelineTab } from './PipelineTab';
 import { TerminalTab } from './TerminalTab';
 import { Textarea } from './ui/input';
@@ -393,7 +397,7 @@ function ValidationView({ run }: { run: Run }) {
   const results = run.validation ?? [];
   return (
     <div className="space-y-4 p-5">
-      <p className="text-sm text-muted-foreground">Commands run by Kanbuild in the worktree (no agent, no tokens). The first failure stops the run and is sent back to the developer.</p>
+      <p className="text-sm text-muted-foreground">Commands run by Kanbot in the worktree (no agent, no tokens). The first failure stops the run and is sent back to the developer.</p>
       <div className="metal-surface divide-y overflow-hidden rounded-xl">
         {results.map((r, i) => {
           const ok = r.exitCode === 0 && !r.timedOut;
@@ -484,7 +488,7 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
   useEffect(() => {
     setSelectedRunId(null);
     setRuns([]);
-    setTab(feature?.status === 'done' ? 'report' : 'overview');
+    setTab(feature?.status === 'backlog' ? 'ticket' : feature?.status === 'done' ? 'report' : 'overview');
     setFocus(null);
     if (featureId) api.runs(featureId).then(setRuns).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -532,10 +536,10 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
 
   const doDelete = async () => {
     const ok = await confirm({
-      title: 'Delete feature?',
+      title: 'Delete ticket?',
       description: (
         <>
-          The card and its run history are removed{isActive(feature.agentStatus) ? ' and the running agent is cancelled' : ''}.
+          The card, its chat and its run history are removed from the board{feature.issueNumber ? `; issue #${feature.issueNumber} stays on GitHub and comes back on the next sync while it is open` : ''}{isActive(feature.agentStatus) ? ' and the running agent is cancelled' : ''}.
           {feature.branch && <> The branch <code className="font-mono">{feature.branch}</code> and its worktree are kept on disk.</>}
         </>
       ),
@@ -574,10 +578,15 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
       <SheetContent aria-describedby={undefined}>
         <div className="border-b border-foreground/10 p-5 pr-12">
           <div className="flex items-center gap-2">
-            <PriorityBadge priority={feature.priority} />
-            <AgentStatusBadge status={run?.status ?? feature.agentStatus} />
+            <Badge variant="outline">{COLUMN_LABEL[feature.status]}</Badge>
+            {feature.issueNumber && (
+              <a href={feature.issueUrl ?? '#'} target="_blank" rel="noreferrer" className="font-mono text-xs text-muted-foreground hover:underline">
+                #{feature.issueNumber}
+              </a>
+            )}
+            {feature.priority !== 'medium' && <PriorityBadge priority={feature.priority} />}
+            {(feature.status === 'build' || feature.agentStatus) && <AgentStatusBadge status={run?.status ?? feature.agentStatus} />}
             <PipelineChip feature={feature} />
-            <Badge variant="outline" className="capitalize">{feature.status}</Badge>
             {run && <span className="text-xs text-muted-foreground">{runLabel(run)} · {roleLabel(run.role)}</span>}
           </div>
           <DialogPrimitive.Title className="mt-2.5 text-xl font-semibold leading-tight tracking-tight">{feature.title}</DialogPrimitive.Title>
@@ -601,7 +610,7 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
               </Button>
             )}
             {isPaused(feature) && (
-              <Button size="sm" variant="gold" onClick={() => act(() => api.continuePipeline(feature.id), 'Pipeline continued')} title="The last step finished but the next one did not start">
+              <Button size="sm" variant="gold" onClick={() => act(() => api.continuePipeline(feature.id), 'Pipeline continued')} title="Re-runs the pipeline's last decision: start the next step, or open the pull request">
                 <Play /> Continue pipeline
               </Button>
             )}
@@ -654,11 +663,15 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
           </div>
         </div>
 
+        <HumanActionsPanel feature={feature} />
         {feature.gate && <GatePanel feature={feature} runs={runs} onShowDiff={() => setTab('changes')} onDone={() => setSelectedRunId(null)} />}
 
         <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col">
           <div className="px-5 pt-3">
             <TabsList className="flex w-full overflow-x-auto">
+              <TabsTrigger value="ticket">
+                <MessagesSquare className="h-3.5 w-3.5" /> Ticket{feature.openDecisions > 0 ? ` (${feature.openDecisions})` : ''}
+              </TabsTrigger>
               <TabsTrigger value="overview"><LayoutDashboard className="h-3.5 w-3.5" /> Overview</TabsTrigger>
               <TabsTrigger value="pipeline"><Workflow className="h-3.5 w-3.5" /> Pipeline</TabsTrigger>
               <TabsTrigger value="activity"><Activity className="h-3.5 w-3.5" /> Activity</TabsTrigger>
@@ -668,6 +681,10 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
               <TabsTrigger value="terminal"><SquareTerminal className="h-3.5 w-3.5" /> Terminal</TabsTrigger>
             </TabsList>
           </div>
+
+          <TabsContent value="ticket" className="min-h-0 flex-1 flex-col data-[state=active]:flex">
+            <TicketPanel feature={feature} githubConfigured={githubConfigured} />
+          </TabsContent>
 
           <TabsContent value="overview" className="min-h-0 flex-1 overflow-y-auto">
             <div className="space-y-5 p-5">
@@ -685,7 +702,25 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
                   )}
                 </section>
               ) : (
-                <p className="text-sm text-muted-foreground">No agent has run yet. Drag the card into Build to start one.</p>
+                <p className="text-sm text-muted-foreground">No agent has run yet. Drag the card into Build to start planning.</p>
+              )}
+              {feature.pr && (
+                <section className="metal-surface flex flex-wrap items-center gap-2 rounded-xl p-3 text-sm">
+                  <GitPullRequest className="h-4 w-4" />
+                  <a href={feature.prUrl ?? '#'} target="_blank" rel="noreferrer" className="font-medium hover:underline">
+                    Pull request #{feature.prNumber}
+                  </a>
+                  <Badge variant={feature.pr.state === 'merged' ? 'violet' : feature.pr.state === 'closed' ? 'red' : 'green'}>{feature.pr.draft && feature.pr.state === 'open' ? 'draft' : feature.pr.state}</Badge>
+                  {feature.pr.state === 'open' && feature.pr.checks && (
+                    <Badge variant={feature.pr.checks === 'passing' ? 'green' : feature.pr.checks === 'failing' ? 'red' : 'amber'}>CI {feature.pr.checks}</Badge>
+                  )}
+                  {feature.pr.labels.map((l) => (
+                    <Badge key={l} variant="gray">{l}</Badge>
+                  ))}
+                  <span className="ml-auto text-[11px] text-muted-foreground">
+                    {feature.pr.state === 'open' ? 'You review and merge; agents never merge.' : ''} Synced {new Date(feature.pr.syncedAt).toLocaleTimeString()}
+                  </span>
+                </section>
               )}
               {report?.self.review && <ReviewSection review={report.self.review} onJump={jumpToDiff} />}
               {report?.self.plan && !feature.gate && (
@@ -745,8 +780,10 @@ export function AgentDetailSheet({ featureId, onClose, onEdit }: { featureId: st
                 </section>
               )}
               <section>
-                <h3 className="mb-2 text-sm font-semibold">Description</h3>
-                <pre className="whitespace-pre-wrap rounded-xl metal-inset p-3 font-sans text-sm">{feature.description || <span className="text-muted-foreground">No description.</span>}</pre>
+                <h3 className="mb-2 text-sm font-semibold">{feature.issueNumber ? `Issue #${feature.issueNumber}` : 'Description'}</h3>
+                <div className="prose-report metal-inset max-h-96 overflow-y-auto rounded-xl p-4 text-sm">
+                  {feature.description ? <Markdown>{feature.description}</Markdown> : <span className="text-muted-foreground">No description.</span>}
+                </div>
               </section>
               <section className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
                 <div><span className="text-muted-foreground">Branch: </span><span className="font-mono">{feature.branch ?? '—'}</span></div>

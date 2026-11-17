@@ -3,29 +3,66 @@ import { getDb, newId, now } from './db.ts';
 import { bus } from './events.ts';
 import { expandHome, validateRepoPath } from './git.ts';
 import { getSettings } from './settings.ts';
-import { CLAUDE_ROLES, type PipelineConfig, type Project, type RolesConfig } from '../../shared/types.ts';
+import { CLAUDE_ROLES, type HumanActionRule, type PipelineConfig, type Project, type RolesConfig } from '../../shared/types.ts';
+
+export const DEFAULT_HUMAN_ACTION_RULES: HumanActionRule[] = [
+  {
+    pattern: 'supabase/migrations/**',
+    label: 'Migration',
+    detail: 'Run `supabase db push --linked`, then add the `migration-applied` label to the pull request. Agents never do either.',
+    doneLabel: 'migration-applied',
+  },
+];
 
 export const DEFAULT_PIPELINE: PipelineConfig = {
   plan: true,
-  planApproval: true,
+  planApproval: false,
   validate: true,
   validationCommands: [],
-  tester: true,
-  reviewer: false,
+  tester: false,
+  reviewer: true,
   finalApproval: false,
   maxFixLoops: 2,
-  autoCreatePr: false,
-  prDraft: true,
+  maxReviewLoops: 5,
+  preflight: true,
+  postPlanToIssue: true,
+  assignPr: true,
+  prReviewers: [],
+  humanActionRules: DEFAULT_HUMAN_ACTION_RULES,
+  autoCreatePr: true,
+  prDraft: false,
   remote: 'origin',
   autoStart: null,
 };
+
+function cleanRules(v: unknown, base: HumanActionRule[]): HumanActionRule[] {
+  if (!Array.isArray(v)) return base;
+  return v
+    .map((r: any) => ({
+      pattern: String(r?.pattern ?? '').trim().slice(0, 300),
+      label: String(r?.label ?? '').trim().slice(0, 60),
+      detail: String(r?.detail ?? '').trim().slice(0, 1000),
+      doneLabel: String(r?.doneLabel ?? '').trim().slice(0, 100),
+    }))
+    .filter((r) => r.pattern && r.label)
+    .slice(0, 30);
+}
 
 /** Merge a (partial, possibly untrusted) pipeline config over a base config. */
 export function cleanPipeline(input: unknown, base: PipelineConfig = DEFAULT_PIPELINE): PipelineConfig {
   const v = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
   const bool = (k: keyof PipelineConfig) => (typeof v[k] === 'boolean' ? (v[k] as boolean) : (base[k] as boolean));
   const loops = Number(v.maxFixLoops);
+  const reviewLoops = Number(v.maxReviewLoops);
   return {
+    maxReviewLoops: Number.isFinite(reviewLoops) && v.maxReviewLoops !== undefined && v.maxReviewLoops !== null ? Math.max(0, Math.min(10, Math.floor(reviewLoops))) : base.maxReviewLoops,
+    preflight: bool('preflight'),
+    postPlanToIssue: bool('postPlanToIssue'),
+    assignPr: bool('assignPr'),
+    prReviewers: Array.isArray(v.prReviewers)
+      ? [...new Set(v.prReviewers.map((x) => String(x).trim().replace(/^@/, '')).filter((x) => /^[\w-]{1,39}$/.test(x)))].slice(0, 10)
+      : base.prReviewers,
+    humanActionRules: cleanRules(v.humanActionRules, base.humanActionRules),
     plan: bool('plan'),
     planApproval: bool('planApproval'),
     validate: bool('validate'),
@@ -71,6 +108,10 @@ export const DEFAULT_ALLOWED_TOOLS = [
   'Bash(git add:*)',
   'Bash(git commit:*)',
   'Bash(git show:*)',
+  'Bash(git merge:*)',
+  'Bash(git mv:*)',
+  'Bash(git rm:*)',
+  'Bash(git restore:*)',
   'Bash(npm:*)',
   'Bash(npx:*)',
   'Bash(pnpm:*)',
@@ -105,6 +146,7 @@ function rowToProject(r: any): Project {
     model: r.model,
     agentProfile: r.agent_profile ?? '',
     effort: r.effort ?? '',
+    repoSlug: r.repo_slug ?? '',
     mcpConfig: r.mcp_config ?? '',
     mcpServers: cleanNames(safeJsonArray(r.mcp_servers_json)),
     skills: cleanNames(safeJsonArray(r.skills_json)),
@@ -192,6 +234,7 @@ export async function createProject(input: ProjectInput): Promise<Project> {
     model: input.model ?? '',
     agentProfile: cleanProfile(input.agentProfile, ''),
     effort: cleanEffort(input.effort, ''),
+    repoSlug: '',
     mcpConfig: input.mcpConfig ?? '',
     mcpServers: cleanNames(input.mcpServers),
     skills: cleanNames(input.skills),
@@ -273,6 +316,13 @@ export async function updateProject(id: string, input: ProjectInput): Promise<Pr
     );
   bus.publish({ type: 'project.updated', project: next });
   return next;
+}
+
+export function setRepoSlug(id: string, slug: string) {
+  const p = getProject(id);
+  if (p.repoSlug === slug) return;
+  getDb().prepare('UPDATE projects SET repo_slug = ? WHERE id = ?').run(slug, id);
+  bus.publish({ type: 'project.updated', project: { ...p, repoSlug: slug } });
 }
 
 /** Removes the project from the dashboard only. Source code and worktrees on disk are untouched. */

@@ -118,3 +118,18 @@ See [git-worktrees-validation.md](git-worktrees-validation.md#terminal-command-r
 2. Add the client function in `web/src/api.ts`.
 3. Update this doc.
 4. If the response shape changes in a way old dashboards can't handle, bump `API_VERSION`.
+
+## Added by Kanbot (see [issue-pr-workflow.md](issue-pr-workflow.md))
+
+| Method and path | What it does |
+|---|---|
+| `POST /projects/:id/features` | Body may carry `brainstorm: true`: the ticket's text opens the backlog chat. Without it the ticket is created as written and, with a token, published as a GitHub issue |
+| `POST /projects/:id/sync` | `syncProject`: import and update issues, refresh pull requests. Returns `{imported, updated, closed, merged, repo}`. 409 while a sync is running |
+| `GET /features/:id/chat` | The ticket's chat messages |
+| `POST /features/:id/chat` | `{message, answers}`: reply and/or answer decision cards (`answers`: card id → choice). Backlog only (409), 400 when both are empty |
+| `POST /features/:id/chat/start` | Start the chat from the ticket's own text (an imported issue) |
+| `POST /features/:id/issue` | `publishIssue`: create or update the GitHub issue from the draft now |
+| `PATCH /features/:id/human-actions` | `{id, done}`: tick a human action |
+| `PATCH /features/:id` | A changed title or description updates the GitHub issue. `status: 'build'` from the Backlog publishes a draft first and returns 409 while decisions are open. `status: 'pr_open'` needs a PR (409) |
+
+`GET /settings` also returns `roleDefaultModels`. WebSocket: `chat.message {message}` for new and updated chat messages.

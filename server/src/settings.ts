@@ -13,6 +13,7 @@ const DEFAULTS: Settings = {
   notifications: 'all',
   systemNotifications: process.platform === 'darwin',
   autoStartBuild: true,
+  syncIntervalSec: 60,
 };
 
 export function getSettings(): Settings {
@@ -37,6 +38,10 @@ export function updateSettings(patch: Partial<Settings>): Settings {
       const n = Math.max(1, Math.min(16, Math.floor(Number(v))));
       if (!Number.isFinite(n)) continue;
       stmt.run(k, JSON.stringify(n));
+    } else if (k === 'syncIntervalSec') {
+      const n = Math.floor(Number(v));
+      if (!Number.isFinite(n)) continue;
+      stmt.run(k, JSON.stringify(n <= 0 ? 0 : Math.max(20, Math.min(3600, n))));
     } else if (k === 'maxBudgetUsd') {
       const n = Math.max(0, Number(v));
       if (!Number.isFinite(n)) continue;

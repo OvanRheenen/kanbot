@@ -50,12 +50,15 @@ afterAll(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+/** No GitHub token in this suite: a finished pipeline leaves the card in Build, ready for "Create PR". */
+const isReady = (x: any) => x.status === 'build' && x.agentStatus === 'completed' && !x.gate && x.run?.currentActivity === 'Ready for a pull request';
+
 describe('end-to-end orchestration with a fake Claude Code', () => {
   it('runs features concurrently up to the limit, queues the rest, and reports', async () => {
     const { projects, features, settings, runs, orch } = mods;
     settings.updateSettings({ concurrency: 2 });
     // Classic single-agent flow: no plan, validation, tester or reviewer.
-    const project = await projects.createProject({ path: repo, pipeline: { plan: false, validate: false, tester: false, reviewer: false } });
+    const project = await projects.createProject({ path: repo, pipeline: { plan: false, validate: false, tester: false, reviewer: false, preflight: false } });
     expect(project.worktreeRoot).toBe(path.join(tmp, 'Tiles-worktrees'));
     const f = ['Portfolio charts', 'Onboarding', 'Account settings'].map((t) =>
       features.createFeature(project.id, { title: t, description: 'Do it well' }),
@@ -69,12 +72,12 @@ describe('end-to-end orchestration with a fake Claude Code', () => {
 
     const done = await waitFor(() => {
       const all = features.listFeatures(project.id);
-      return all.every((x: any) => x.status === 'done') && all;
+      return all.every((x: any) => isReady(x)) && all;
     }, 30000);
 
     for (const feat of done) {
       expect(feat.agentStatus).toBe('completed');
-      expect(feat.branch).toMatch(/^feature\//);
+      expect(feat.branch).toMatch(/^feat\//);
       expect(fs.existsSync(feat.worktreePath)).toBe(true);
       expect(feat.worktreePath.startsWith(project.worktreeRoot)).toBe(true);
       expect(feat.sessionId).toMatch(/^sess-/);
@@ -134,7 +137,7 @@ describe('end-to-end orchestration with a fake Claude Code', () => {
     orch.orchestrator.enqueue(f.id);
     const done = await waitFor(() => {
       const x = features.getFeature(f.id);
-      return x.status === 'done' && x;
+      return isReady(x) && x;
     });
     const firstArgs = JSON.parse(fs.readFileSync(path.join(argsDir, fs.readdirSync(argsDir).find((n) => n.startsWith(done.sessionId))!), 'utf8'));
     expect(firstArgs.args).toContain('--strict-mcp-config');
@@ -149,7 +152,7 @@ describe('end-to-end orchestration with a fake Claude Code', () => {
     expect(features.getFeature(f.id).status).toBe('build');
     const again = await waitFor(() => {
       const x = features.getFeature(f.id);
-      return x.status === 'done' && x.currentRunId !== done.currentRunId && x;
+      return isReady(x) && x.currentRunId !== done.currentRunId && x;
     });
     expect(again.sessionId).toBe(done.sessionId);
     const followRun = runs.getRun(again.currentRunId);
@@ -192,12 +195,13 @@ describe('end-to-end orchestration with a fake Claude Code', () => {
       expect(orch.orchestrator.startFeature(f.id).agentStatus).toBe('queued');
       const done = await waitFor(() => {
         const x = features.getFeature(f.id);
-        return x.status === 'done' && x;
+        return isReady(x) && x;
       }, 30000);
       expect(done.agentStatus).toBe('completed');
-      await waitFor(() => features.getFeature(auto.id).status === 'done', 30000);
+      await waitFor(() => isReady(features.getFeature(auto.id)), 30000);
 
       // Done -> Build with auto-start off waits again instead of starting a new cycle.
+      features.moveFeature(f.id, 'done');
       const back = orch.orchestrator.enterBuild(f.id);
       expect(back.status).toBe('build');
       expect(back.agentStatus).toBeNull();

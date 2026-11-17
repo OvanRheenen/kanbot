@@ -38,6 +38,9 @@ export function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv 
   for (const k of INHERITED_SESSION_VARS) delete env[k];
   delete env.ORCH_GITHUB_TOKEN;
   delete env.ORCH_GIT_TOKEN;
+  // Agents never talk to GitHub: no ambient token for `gh` or git either.
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
   // The orchestrator's own Node settings must not leak into the project's tooling: NODE_ENV=production
   // makes React load its production build (no act()) and makes npm skip devDependencies (no Jest).
   // Test runners and bundlers set NODE_ENV themselves.

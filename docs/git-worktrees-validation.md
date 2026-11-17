@@ -22,8 +22,9 @@ Source files: `server/src/terminal.ts`, `server/src/git.ts`, `server/src/diffPar
 ### Worktree lifecycle
 
 **Naming.** `allocateBranchAndPath(repo, worktreeRoot, title, featureId)` (line 94):
-- Branch: **`feature/<slug>-<short>`**.
-- Worktree: **`<worktreeRoot>/feature-<slug>-<short>`**.
+- Branch: **`feat/<issue>-<slug>`** for a ticket with a GitHub issue, else **`feat/<slug>-<short>`**.
+- Worktree: **`<worktreeRoot>/feat-<same name>`**.
+- The branch starts from the **fresh base**: `Orchestrator.freshBase` fetches `<remote>/<baseBranch>` (with the GitHub token when one is set) and the worktree is created from that remote-tracking ref with `--no-track`, so the branch never gets the base as its upstream. Without a remote, or when the fetch fails and nothing was fetched before, it starts from the local base branch. `feature.baseRef` records the ref.
 - `short` = the first 6 characters of the feature ID after its prefix.
 - On a collision it tries suffixes `-1`…`-49`, then throws.
 
@@ -76,7 +77,7 @@ Source files: `server/src/terminal.ts`, `server/src/git.ts`, `server/src/diffPar
   | more than one | `{error: "Cannot stack on several unmerged dependencies… Merge all but one…"}` (fails the run) |
 
 - **Blocking** is decided in `tick()` (orchestrator): a feature whose dependencies are not **Done** waits, but only before it has a worktree.
-- Done ≠ merged: `isMerged` decides whether the new branch starts from the base branch or is stacked.
+- **Branches are never stacked.** A ticket with dependencies waits in the queue until every dependency is **Done** (its pull request merged, or its issue closed), then starts from the fresh base like any other. `chooseBaseRef` in `dependencies.ts` is no longer called by the orchestrator.
 - `feature.baseRef` stores the ref the branch was created from. Diffs and PRs use `baseRef || project.baseBranch`.
 
 ## validation.ts (no agent, no tokens)

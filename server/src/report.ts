@@ -1,6 +1,8 @@
 import type {
   AgentRole,
   AgentSelfReport,
+  DecisionCard,
+  IssueDraft,
   AgentStatus,
   Changes,
   Feature,
@@ -43,6 +45,13 @@ export function emptySelfReport(): AgentSelfReport {
     docsUpdated: [],
     plan: '',
     needsClarification: [],
+    clarificationOptions: [],
+    reply: '',
+    decisions: [],
+    issue: null,
+    prTitle: '',
+    prBody: '',
+    humanActions: [],
     review: null,
     reported: false,
   };
@@ -74,6 +83,61 @@ function parseReview(v: any): ReviewResult | null {
   return { verdict, summary: asString(v.summary), findings };
 }
 
+/** Clarification questions: plain strings, or `{question, options}` objects (decision cards). */
+function parseQuestions(v: unknown): { questions: string[]; options: string[][] } {
+  const list = Array.isArray(v) ? v : typeof v === 'string' && v.trim() ? [v] : [];
+  const questions: string[] = [];
+  const options: string[][] = [];
+  for (const item of list) {
+    const isObj = item && typeof item === 'object' && !Array.isArray(item);
+    const q = isObj ? asString((item as any).question ?? (item as any).text) : asString(item);
+    if (!q.trim()) continue;
+    questions.push(q);
+    options.push(isObj ? asStringArray((item as any).options).slice(0, 6) : []);
+  }
+  return { questions, options };
+}
+
+function parseDecisions(v: unknown): Omit<DecisionCard, 'answer'>[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((d: any, i: number) => ({
+      id: asString(d?.id) || `d${i + 1}`,
+      question: asString(d?.question ?? d?.title),
+      options: (Array.isArray(d?.options) ? d.options : [])
+        .map((o: any) => (o && typeof o === 'object' ? { label: asString(o.label ?? o.title), description: asString(o.description ?? o.detail) } : { label: asString(o), description: '' }))
+        .filter((o: { label: string }) => o.label)
+        .slice(0, 6),
+    }))
+    .filter((d) => d.question)
+    .slice(0, 8);
+}
+
+function parseIssue(v: any, ready: unknown): IssueDraft | null {
+  if (!v || typeof v !== 'object') return null;
+  const title = asString(v.title).trim();
+  const body = asString(v.body ?? v.description).trim();
+  if (!title && !body) return null;
+  return {
+    title,
+    body,
+    labels: asStringArray(v.labels).map((l) => l.trim()).filter(Boolean).slice(0, 20),
+    size: asString(v.size).trim().toUpperCase().slice(0, 4),
+    dependsOn: (Array.isArray(v.depends_on ?? v.dependsOn) ? (v.depends_on ?? v.dependsOn) : [])
+      .map((n: unknown) => Number(String(n).replace(/^#/, '')))
+      .filter((n: number) => Number.isInteger(n) && n > 0),
+    ready: ready === true || v.ready === true,
+  };
+}
+
+function parseHumanActions(v: unknown): { label: string; detail: string }[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((a: any) => (a && typeof a === 'object' ? { label: asString(a.label ?? a.title).trim(), detail: asString(a.detail ?? a.description ?? a.why).trim() } : { label: asString(a).trim().slice(0, 60), detail: asString(a).trim() }))
+    .filter((a) => a.label)
+    .slice(0, 12);
+}
+
 /**
  * Extract the agent's structured self-report from its final message.
  * Looks for the last ```json fenced block (or a bare top-level JSON object) containing a "summary" key.
@@ -92,7 +156,7 @@ export function extractSelfReport(text: string): AgentSelfReport {
   for (const c of candidates.reverse()) {
     try {
       const parsed = JSON.parse(c);
-      if (parsed && typeof parsed === 'object' && ['summary', 'tests', 'plan', 'review', 'needs_clarification'].some((k) => k in parsed)) {
+      if (parsed && typeof parsed === 'object' && ['summary', 'tests', 'plan', 'review', 'needs_clarification', 'reply', 'issue', 'pr_body'].some((k) => k in parsed)) {
         obj = parsed;
         break;
       }
@@ -125,7 +189,16 @@ export function extractSelfReport(text: string): AgentSelfReport {
   report.outstandingIssues = asStringArray(obj.outstanding_issues ?? obj.outstandingIssues ?? obj.issues);
   report.docsUpdated = asStringArray(obj.docs_updated ?? obj.docsUpdated);
   report.plan = asString(obj.plan);
-  report.needsClarification = asStringArray(obj.needs_clarification ?? obj.needsClarification ?? obj.questions);
+  const qs = parseQuestions(obj.needs_clarification ?? obj.needsClarification ?? obj.questions);
+  report.needsClarification = qs.questions;
+  report.clarificationOptions = qs.options;
+  report.reply = asString(obj.reply);
+  report.decisions = parseDecisions(obj.decisions);
+  report.issue = parseIssue(obj.issue, obj.ready);
+  if (report.issue && report.decisions.length) report.issue.ready = false;
+  report.prTitle = asString(obj.pr_title ?? obj.prTitle).trim();
+  report.prBody = asString(obj.pr_body ?? obj.prBody).trim();
+  report.humanActions = parseHumanActions(obj.human_actions ?? obj.humanActions);
   report.review = parseReview(obj.review);
   return report;
 }
@@ -163,7 +236,7 @@ export function buildReport(args: {
   const { feature, project, self, changes, usage } = args;
   const lines: string[] = [];
   // Planner and reviewer don't change code or run tests: skip those sections.
-  const readOnly = args.role === 'planner' || args.role === 'reviewer';
+  const readOnly = args.role === 'planner' || args.role === 'reviewer' || args.role === 'writer';
   let section = 0;
   const h = (title: string) => `## ${++section}. ${title}`;
   lines.push(`# ${reportTitle(args.kind, args.role, args.fixReason)}: ${feature.title}`);
@@ -186,6 +259,27 @@ export function buildReport(args: {
   if (self.needsClarification.length) {
     lines.push('## Questions for the user');
     self.needsClarification.forEach((q, i) => lines.push(`${i + 1}. ${q}`));
+    lines.push('');
+  }
+
+  if (self.reply) {
+    lines.push('## Reply');
+    lines.push(self.reply);
+    lines.push('');
+  }
+  if (self.issue) {
+    lines.push(`## Issue draft${self.issue.ready ? '' : ' (decisions open)'}: ${self.issue.title}`);
+    lines.push(self.issue.body);
+    lines.push('');
+  }
+  if (self.humanActions.length) {
+    lines.push('## Human action required');
+    for (const a of self.humanActions) lines.push(`- **${a.label}**${a.detail && a.detail !== a.label ? `: ${a.detail}` : ''}`);
+    lines.push('');
+  }
+  if (self.prBody) {
+    lines.push('## Pull request description');
+    lines.push(self.prBody);
     lines.push('');
   }
 

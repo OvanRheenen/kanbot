@@ -1,11 +1,11 @@
 # Testing
 
-Source files: `server/test/*.test.ts`, `server/test/fixtures/fake-claude.mjs`, `desktop/test/env.test.ts`, `.github/workflows/ci.yml`
+Source files: `server/test/*.test.ts`, `server/test/fixtures/fake-claude.mjs`, `server/test/fixtures/fake-github.mjs`, `.github/workflows/ci.yml`
 
 ## Running
 
 ```bash
-npm test                                          # server tests, then desktop tests (vitest run)
+npm test                                          # server tests (vitest run)
 cd server && npx vitest run test/pipeline.test.ts # one file
 npm run typecheck                                 # server + web tsc (web's only check)
 ```
@@ -14,7 +14,6 @@ npm run typecheck                                 # server + web tsc (web's only
 
 **Web:** no tests and no linter.
 
-**Desktop:** `desktop/test/env.test.ts` unit-tests the pure helpers in `desktop/src/env.ts` (login-shell PATH parsing, PATH fallback, backend env, local-URL check). The Electron main process has no automated test. To smoke-test it on Linux, run Playwright's `_electron.launch` under `xvfb-run` with `--no-sandbox`, `ORCH_DATA_DIR`, `ORCH_CLAUDE_BIN=<fake>` and `ORCH_NODE_BIN=node` (see [desktop-app.md](desktop-app.md)).
 
 **CI:** `.github/workflows/ci.yml` runs typecheck, tests and the web/server builds on Ubuntu and macOS.
 
@@ -86,3 +85,29 @@ It exits 0, or 1 on failure; SIGTERM → exit 143.
 | `FAKE_CLAUDE_ARGS_DIR` | Writes `{args, cwd, role}` JSON per invocation, so tests can assert CLI flags |
 
 If you change prompt markers, report schemas or CLI flags, update the fake and its tests together.
+
+## Added by Kanbot
+
+- **`workflow.test.ts`** (e2e): backlog chat → decision card → issue created; Build with the default pipeline
+  (plan → develop → review ⇄ fix → preflight) → PR Open with human-action tags; PR refresh (CI, `migration-applied`,
+  merged → Done); issue import, dependencies, edits and closes from GitHub; no token → "Ready for a pull request" →
+  `continuePipeline`. It has its own GitHub double with issues and pull requests in one number sequence.
+- **`pipeline.unit.test.ts`**: "issue → PR workflow steps" covers the default decisions, the review loop limit and the
+  preflight. The older suites pin the classic pipeline explicitly (`preflight: false`, `autoCreatePr: false`, …), and wait
+  for "Ready for a pull request" where they used to wait for Done.
+- Test repositories redirect the GitHub URL to a local bare repository with `url.<bare>.insteadOf`, so fetch and push stay local.
+- **fake-claude knobs:** `FAKE_WRITER_DECISION=1` (the writer asks one decision first), `FAKE_TESTS_NOT_RUN` (a command the
+  preflight reports as not run). The writer role drafts an issue; a developer prompt with the preflight marker reports
+  `pr_title`, `pr_body` and `human_actions`; a title containing "migration" makes the developer add
+  `supabase/migrations/…`. A resumed session remembers its ticket's title. Invocations without `-p` exit at once.
+- **`fake-github.mjs`**: standalone GitHub double for UI demos:
+
+  ```bash
+  node server/test/fixtures/fake-github.mjs 4999 &
+  ```
+
+  ```bash
+  ORCH_GITHUB_API_URL=http://127.0.0.1:4999 ORCH_CLAUDE_BIN=$PWD/server/test/fixtures/fake-claude.mjs npm start
+  ```
+
+  Demo controls: `POST /_demo/merge/<pr>`, `POST /_demo/label/<pr>/<label>`, `POST /_demo/checks/<success|failure|pending>`.

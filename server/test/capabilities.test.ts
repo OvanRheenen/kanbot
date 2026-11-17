@@ -1,3 +1,4 @@
+import { blankFeature } from '../src/features.ts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -51,11 +52,11 @@ afterAll(() => {
 
 const settings: Settings = {
   concurrency: 2, agentProfile: 'lean', effort: '', maxBudgetUsd: 0, defaultModel: '', editorCommand: 'vscode', claudeBinary: 'claude',
-  notifications: 'all', systemNotifications: false, autoStartBuild: true,
+  notifications: 'all', systemNotifications: false, autoStartBuild: true, syncIntervalSec: 0,
 };
 const mkProject = (p: Partial<Project> = {}): Project => ({
   id: 'prj', name: 'Repo', description: '', path: repo, baseBranch: 'main', worktreeRoot: '/w', allowedTools: ['Read'], model: '', agentProfile: '',
-  effort: '', mcpConfig: '', mcpServers: [], skills: [], pipeline: DEFAULT_PIPELINE, roles: {}, createdAt: '', ...p,
+  effort: '', repoSlug: '', mcpConfig: '', mcpServers: [], skills: [], pipeline: DEFAULT_PIPELINE, roles: {}, createdAt: '', ...p,
 });
 
 describe('catalog discovery', () => {
@@ -129,7 +130,7 @@ describe('capabilities at launch', () => {
     expect(args).not.toContain('--strict-mcp-config');
     expect(args[args.indexOf('--allowedTools') + 1]).toContain(mcpToolPrefix('claude.ai Gmail'));
     expect(mcpToolPrefix('claude.ai Gmail')).toBe('mcp__claude_ai_Gmail');
-    const denied = args[args.indexOf('--disallowedTools') + 1].split(',');
+    const denied = args[args.indexOf('--disallowedTools') + 1].split(',').filter((t: string) => t.startsWith('mcp__'));
     expect(denied.sort()).toEqual(['mcp__linter', 'mcp__localdb', 'mcp__sentry']);
   });
   it('ships selected user/plugin skills through a session plugin in the lean profile', () => {
@@ -165,11 +166,11 @@ describe('file references', () => {
     expect(extractFileRefs('See @src/a.ts, and (@b/c.md). Email me@x.com @src/a.ts @../etc/passwd @/abs')).toEqual(['src/a.ts', 'b/c.md']);
   });
   it('adds a Referenced files section to prompts', () => {
-    const feature: Feature = {
+    const feature: Feature = blankFeature({
       id: 'f', projectId: 'prj', title: 'T', description: 'Use @.mcp.json and @nope.ts', priority: 'low', status: 'build', position: 0, branch: null,
       worktreePath: null, sessionId: null, agentStatus: null, currentRunId: null, dependsOn: [], blockedBy: [], gate: null, baseRef: null, prUrl: null,
       prNumber: null, createdAt: '', updatedAt: '',
-    };
+    });
     const prompt = buildPrompt(feature, mkProject(), 'feature/x', 1);
     expect(prompt).toContain('**Referenced files**');
     expect(prompt).toContain('- `.mcp.json`\n');

@@ -16,7 +16,7 @@ import {
   type DragStartEvent,
 } from '@dnd-kit/core';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
-import { Bot, CheckCheck, Inbox, Plus } from 'lucide-react';
+import { Bot, CheckCheck, GitPullRequest, Inbox, Plus } from 'lucide-react';
 import type { Feature, FeatureStatus } from '@shared/types.ts';
 import { api } from '@/api';
 import { getState, upsertFeature, useStore } from '@/store';
@@ -29,9 +29,10 @@ import { toast, toastError } from './toast';
 import { isActive, isReadyToStart } from './status';
 
 const COLUMNS: { id: FeatureStatus; title: string; icon: React.ElementType; hint: string }[] = [
-  { id: 'backlog', title: 'Backlog', icon: Inbox, hint: 'Drag a card into Build to start an agent' },
-  { id: 'build', title: 'Build', icon: Bot, hint: 'Agents working in isolated worktrees' },
-  { id: 'done', title: 'Done', icon: CheckCheck, hint: 'Completed features ready for review' },
+  { id: 'backlog', title: 'Backlog', icon: Inbox, hint: 'Brainstorm tickets here; drag one into Build to start the agents' },
+  { id: 'build', title: 'Build', icon: Bot, hint: 'Plan → implement → review, each ticket in its own worktree' },
+  { id: 'pr_open', title: 'PR Open', icon: GitPullRequest, hint: 'Pull requests waiting for your review and merge' },
+  { id: 'done', title: 'Done', icon: CheckCheck, hint: 'Merged pull requests and closed issues' },
 ];
 
 type ColumnsState = Record<FeatureStatus, string[]>;
@@ -53,7 +54,7 @@ const columnFirstCollision: CollisionDetection = (args) => {
 };
 
 function buildColumns(features: Feature[]): ColumnsState {
-  const cols: ColumnsState = { backlog: [], build: [], done: [] };
+  const cols: ColumnsState = { backlog: [], build: [], pr_open: [], done: [] };
   for (const f of [...features].sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt))) {
     cols[f.status].push(f.id);
   }
@@ -93,7 +94,7 @@ function Column({
   return (
     <div
       ref={setNodeRef}
-      className={cn('metal-glass flex min-h-0 w-full min-w-[280px] flex-1 flex-col rounded-2xl transition-shadow', isOver && 'shadow-glow')}
+      className={cn('metal-glass flex min-h-0 w-full min-w-[250px] flex-1 flex-col rounded-2xl transition-shadow', isOver && 'shadow-glow')}
     >
       <div className="flex items-center justify-between px-3 pb-1.5 pt-3">
         <div className="flex items-center gap-2">
@@ -104,7 +105,7 @@ function Column({
           <span className="metal-inset rounded-full px-2 text-[11px] tabular-nums text-muted-foreground">{ids.length}</span>
         </div>
         {onAdd && (
-          <Button size="icon-round" variant="secondary" className="h-7 w-7" onClick={onAdd} title="New feature">
+          <Button size="icon-round" variant="secondary" className="h-7 w-7" onClick={onAdd} title="New ticket">
             <Plus />
           </Button>
         )}
@@ -117,7 +118,7 @@ function Column({
         </SortableContext>
         {ids.length === 0 && (
           <div className="rounded-xl border border-dashed border-foreground/15 p-6 text-center text-xs text-muted-foreground">
-            {id === 'backlog' ? 'No features yet' : id === 'build' ? 'Drop a feature here to start an agent' : 'Nothing finished yet'}
+            {id === 'backlog' ? 'No tickets yet' : id === 'build' ? 'Drop a ticket here to start the agents' : id === 'pr_open' ? 'No open pull requests' : 'Nothing merged yet'}
           </div>
         )}
       </div>
@@ -201,7 +202,19 @@ export function Board({ projectId, onOpen, onAdd }: { projectId: string; onOpen:
           });
           if (!confirmCancel) return setCols(serverCols);
         }
-        if (col === 'build' && startCol === 'done' && autoStart) {
+        if (col === 'pr_open' && !feature.prNumber) {
+          toast('PR Open fills itself: a ticket lands there when its pull request is opened.');
+          return setCols(serverCols);
+        }
+        if (col === 'done' && feature.pr?.state === 'open') {
+          const ok = await confirm({
+            title: 'Move to Done without merging?',
+            description: `Pull request #${feature.prNumber} is still open. Cards move to Done on their own when the PR is merged.`,
+            confirmLabel: 'Move anyway',
+          });
+          if (!ok) return setCols(serverCols);
+        }
+        if (col === 'build' && (startCol === 'done' || startCol === 'pr_open') && autoStart) {
           const ok = await confirm({
             title: 'Start a new agent run?',
             description: `"${feature.title}" will be developed again in its existing worktree (${feature.branch ?? 'new branch'}).`,

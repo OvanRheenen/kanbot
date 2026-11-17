@@ -13,14 +13,14 @@ Source files: everything under `web/` — `src/main.tsx`, `App.tsx`, `store.ts`,
 | Icons | `lucide-react` |
 | Drag and drop | `@dnd-kit` (core, sortable, utilities) |
 | Markdown | `react-markdown` + `remark-gfm` |
-| Font | `@fontsource-variable/inter` (bundled, no CDN, so the Mac app works offline) |
+| Font | `@fontsource-variable/inter` (bundled, no CDN, so the board works offline) |
 
 - **No router** and no state library: a custom store built on `useSyncExternalStore`.
 - **Aliases:** `@` → `web/src`, `@shared` → `../shared`. Shared types are imported as `@shared/types.ts`.
 - **Dev:** Vite on `127.0.0.1:5173`, proxying `/api` and `/ws` (ws:true) to :4317.
 - **Checks:** there are no web tests and no linter. The only check is `npm run typecheck`.
-- `index.html`: title "Kanbuild". The favicon is `/favicon.png` (64 px) plus `/apple-touch-icon.png` (180 px), both from `web/public/`, which Vite copies into `web/dist` for the server to serve.
-- **Branding:** the product name is **Kanbuild**. The mark is `components/Logo.tsx`: an `<img>` of `src/assets/logo.png` (the robot in front of Kanban columns, 256 px, transparent, bundled by Vite), default `h-8 w-8`. Swap the logo there only. The favicons are separate PNGs made from the same artwork.
+- `index.html`: title "Kanbot". The favicon is `/favicon.svg` from `web/public/`, which Vite copies into `web/dist` for the server to serve.
+- **Branding:** the product name is **Kanbot**. The mark is `components/Logo.tsx`, an inline SVG (four board columns with cards) that uses the theme's primary colour. Kanbuild's logo is not used.
 
 ## Bootstrap (`main.tsx`)
 
@@ -88,7 +88,7 @@ Source files: everything under `web/` — `src/main.tsx`, `App.tsx`, `store.ts`,
 The root has the `app-backdrop` (CSS "clouds").
 
 **Sidebar** (`w-64`, a floating `metal-glass` panel)
-- Brand: the `Logo` (`components/Logo.tsx`), "Kanbuild" in `chrome-text`, and a connection dot: "local backend connected" or "reconnecting…".
+- Brand: the `Logo` (`components/Logo.tsx`), "Kanbot" in `chrome-text`, and a connection dot: "local backend connected" or "reconnecting…".
 - Project list (the active row is a `metal-raised` pill):
   - A gold `metal-gold` "N waiting" pill (from `needsAttention`).
   - A cyan dot chip for the active count.
@@ -390,3 +390,28 @@ Under `prefers-reduced-motion`, these animations collapse to 1 ms (spinners and 
 6. Costs are always labeled "est.".
 7. **Textareas with `bg-none`** (no metal gradient) also need `bg-transparent`, or the browser's dark form-field color shows through.
 8. `sheen` sets `overflow: hidden`, so don't put popovers inside an element that uses it.
+
+## Added by Kanbot (see [issue-pr-workflow.md](issue-pr-workflow.md))
+
+- **Board (`Board.tsx`):** four columns: Backlog, Build, PR Open, Done. Dropping a card without a PR on PR Open is refused
+  with a toast; dropping an open PR's card on Done asks first; PR Open or Done → Build asks before a new cycle.
+- **Card (`FeatureCard.tsx`):** `#issue` before the title, size chip (priority only when not medium), amber
+  "YOU: <label>" tags for open human actions (`openHumanActions`), green chips for ticked ones, "n decisions" and "Draft"
+  chips in the Backlog, labels (up to 3), CI chip and "PR #n merged". The description preview is plain text (`plainText`).
+  PR Open and Done cards hide the last run's status badge and progress bar.
+- **Quick add (`FeatureComposer.tsx`) and form (`FeatureDialog.tsx`):** a Brainstorm switch (default on) sends
+  `brainstorm: true`.
+- **Ticket tab (`TicketPanel.tsx`):** left, the issue or its draft (Markdown), link, labels, size, "Create issue now";
+  right, the chat: messages, decision cards (`Decision`: option buttons, first one marked recommended, plus free text) and
+  the composer (⌘/Ctrl + Enter). Live through `onChatMessage` (`store.ts`). It is the default tab for Backlog tickets.
+  `TabsContent` for it uses `data-[state=active]:flex`: a plain `flex` class would keep the hidden tab in the layout.
+- **`HumanActionsPanel`:** above the tabs while a ticket has human actions and is not Done.
+- **Detail sheet:** column badge, issue link, PR summary (state, CI, labels) in Overview, description rendered as Markdown.
+- **`GatePanel.tsx`:** clarification questions show their options as buttons.
+- **`PipelineTab.tsx`:** steps end with PR preflight, the pull request and "Merged by you"; cycle 0 is labelled "Ticket chat".
+- **`ProjectDialog.tsx`:** "After the plan" (implement automatically / wait for my approval), review rounds, preflight,
+  post plan, reviewers, draft PRs, human-action rules (one per line: `glob | tag | what to do | done-label`), and the
+  `writer` role. Model placeholders show `ROLE_DEFAULT_MODEL`.
+- **`App.tsx`:** Sync button and repository link in the header. **`SettingsDialog.tsx`:** sync interval, token permissions.
+- **`status.tsx`:** `hasOpenDecisions`, `openHumanActions`; `needsAttention` also covers open decisions and PR Open cards
+  with open human actions, failing CI or a closed PR; `isPaused` now reads "Ready for PR".

@@ -89,6 +89,21 @@ export function GatePanel({ feature, runs, onShowDiff, onDone }: { feature: Feat
             {(gate.questions ?? []).map((q, i) => (
               <div key={i} className="space-y-1">
                 <p className="text-sm font-medium">{q}</p>
+                {(gate.options?.[i] ?? []).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {gate.options![i].map((o) => (
+                      <Button
+                        key={o}
+                        type="button"
+                        size="sm"
+                        variant={answers[i] === o ? 'default' : 'outline'}
+                        onClick={() => setAnswers((a) => a.map((x, j) => (j === i ? (x === o ? '' : o) : x)))}
+                      >
+                        {o}
+                      </Button>
+                    ))}
+                  </div>
+                )}
                 <Textarea
                   rows={2}
                   value={answers[i] ?? ''}
@@ -124,8 +139,8 @@ export function GatePanel({ feature, runs, onShowDiff, onDone }: { feature: Feat
             <Button size="sm" variant="outline" onClick={onShowDiff}>
               <FileDiff /> Review the diff
             </Button>
-            <Button size="sm" disabled={busy} onClick={() => act('approve', 'Approved — feature moved to Done')}>
-              <Check /> Approve → Done
+            <Button size="sm" disabled={busy} onClick={() => act('approve', 'Approved — opening the pull request')}>
+              <Check /> Approve → open PR
             </Button>
             <Button size="sm" variant="chrome" disabled={busy || !comment.trim()} onClick={() => act('reject', 'Changes requested — the developer continues')}>
               <Pencil /> Request changes

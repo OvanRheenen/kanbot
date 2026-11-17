@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { RUNS_DIR, now } from './db.ts';
-import { chooseBaseRef } from './dependencies.ts';
-import { dependencyRefs, getFeature, moveFeature, patchFeatureState, publishFeature } from './features.ts';
-import { allocateBranchAndPath, collectChanges, createWorktree, headCommit, isMerged } from './git.ts';
-import { getToken } from './github.ts';
+import { addChatMessage, answerDecisions, listChat } from './chat.ts';
+import { chatSessionId, getFeature, listFeatures, moveFeature, patchFeatureState, publishFeature } from './features.ts';
+import { allocateBranchAndPath, collectChanges, createWorktree, gitOk, headCommit } from './git.ts';
+import { commentOnIssue, fetchBranch, getToken } from './github.ts';
+import { projectRepo, publishIssue } from './issues.ts';
 import { notify } from './notify.ts';
 import { firstStep, nextStep, stepLabel, type StepRun } from './pipeline.ts';
 import { createPrForFeature } from './pr.ts';
@@ -16,7 +17,10 @@ import {
   buildFollowupPrompt,
   buildImplementPlanPrompt,
   buildPlanPrompt,
+  buildPreflightPrompt,
   buildPrompt,
+  buildRefinePrompt,
+  buildRefineReplyPrompt,
   buildReplanPrompt,
   buildReviewerPrompt,
   buildTesterPrompt,
@@ -30,7 +34,7 @@ import { LogTail, isAlive, killGroup, launchDetached, readExitCode, readStderrTa
 import { addEvent, createRun, getReport, getRun, latestCycle, listCycleRuns, listRunsByStatus, listRunsForFeature, updateRun, type NewRun, type RunRow } from './runs.ts';
 import { getSettings } from './settings.ts';
 import { ValidationRun, installCommand, resolveValidationCommands } from './validation.ts';
-import { ACTIVE_AGENT_STATUSES, type AgentStatus, type Feature, type Gate, type Project } from '../../shared/types.ts';
+import { ACTIVE_AGENT_STATUSES, type AgentSelfReport, type AgentStatus, type Feature, type Gate, type Project } from '../../shared/types.ts';
 
 const CANCEL_MARK = 'Cancellation requested';
 
@@ -93,6 +97,42 @@ export class Orchestrator {
     return patchFeatureState(featureId, { agentStatus: null, gate: null });
   }
 
+  /**
+   * Backlog chat: the user wrote in a ticket's chat (and/or picked options on its decision cards). The
+   * writer agent answers in the same Claude Code session and keeps the issue draft up to date.
+   */
+  chat(featureId: string, message: string, answers: Record<string, string> = {}): Feature {
+    const feature = getFeature(featureId);
+    if (feature.status !== 'backlog') throw new HttpError(409, 'The ticket chat is for Backlog tickets. Once a ticket is in Build, send a follow-up instead.');
+    this.assertIdle(feature);
+    const answered = answerDecisions(featureId, answers);
+    const parts: string[] = [];
+    if (answered.length) parts.push(`Decisions:\n${answered.map((d) => `- ${d.question} → ${d.answer}`).join('\n')}`);
+    if (message.trim()) parts.push(message.trim());
+    if (!parts.length) throw new HttpError(400, 'Write a message or pick an option');
+    const text = parts.join('\n\n');
+    addChatMessage(featureId, 'user', text);
+    return this.enqueueRefine(featureId, text);
+  }
+
+  /** Queue a writer run. It belongs to cycle 0, so it never takes part in a build pipeline, and the card stays put. */
+  private enqueueRefine(featureId: string, message: string | null): Feature {
+    const run = createRun(featureId, { kind: 'refine', role: 'writer', message, cycle: 0 });
+    addEvent(run.id, 'lifecycle', `Writing the issue queued (run #${run.attempt})`);
+    patchFeatureState(featureId, { agentStatus: 'queued', currentRunId: run.id });
+    setImmediate(() => this.tick());
+    return getFeature(featureId);
+  }
+
+  /** Start the backlog chat for a ticket from its own text (a new idea, or an imported issue that needs work). */
+  startChat(featureId: string): Feature {
+    const feature = getFeature(featureId);
+    if (feature.status !== 'backlog') throw new HttpError(409, 'The ticket chat is for Backlog tickets');
+    this.assertIdle(feature);
+    if (!listChat(featureId).length) addChatMessage(featureId, 'user', feature.description.trim() || feature.title);
+    return this.enqueueRefine(featureId, null);
+  }
+
   /** Back-compat alias used by older callers/tests. */
   enqueue(featureId: string): Feature {
     return this.startFeature(featureId);
@@ -115,6 +155,7 @@ export class Orchestrator {
     this.assertIdle(feature);
     const run = feature.currentRunId ? getRun(feature.currentRunId) : null;
     if (!run) return this.startFeature(featureId);
+    if (run.kind === 'refine') return this.enqueueRefine(featureId, run.message);
     return this.enqueueRun(featureId, { kind: run.kind, role: run.role, message: run.message, fixReason: run.fixReason, cycle: run.cycle });
   }
 
@@ -154,7 +195,8 @@ export class Orchestrator {
       const answers = Array.isArray(input.answers) ? input.answers.map(String) : [];
       if (!answers.some((a) => a.trim())) throw new HttpError(400, 'Answer at least one question');
       const message = formatAnswers(gate.questions ?? [], answers);
-      return this.enqueueRun(featureId, { kind: 'answer', role: gate.role ?? gateRun.role, message, cycle });
+      const role = gate.role ?? gateRun.role;
+      return this.enqueueRun(featureId, { kind: 'answer', role: role === 'writer' ? 'developer' : role, message, cycle });
     }
     if (gate.type === 'final_approval') {
       if (action === 'approve') {
@@ -207,7 +249,7 @@ export class Orchestrator {
 
   /** Agent processes holding a concurrency slot (validation commands don't count). */
   runningCount(): number {
-    return listRunsByStatus(['initialising', 'running']).filter((r) => r.role !== 'validator').length;
+    return listRunsByStatus(['initialising', 'running']).filter((r) => r.role !== 'validator' && r.role !== 'writer').length;
   }
 
   /** Fill free execution slots from the queue (FIFO), skipping features waiting for dependencies. */
@@ -222,7 +264,7 @@ export class Orchestrator {
       for (const run of queued) {
         const feature = getFeatureSafe(run.featureId);
         if (!feature) continue;
-        const needsWorktree = !feature.worktreePath || !fs.existsSync(feature.worktreePath);
+        const needsWorktree = run.kind !== 'refine' && (!feature.worktreePath || !fs.existsSync(feature.worktreePath));
         if (needsWorktree && feature.blockedBy.length) {
           const activity = `Waiting for dependencies: ${feature.blockedBy.map((d) => d.title).join(', ')}`;
           if (run.currentActivity !== activity) {
@@ -231,7 +273,8 @@ export class Orchestrator {
           }
           continue;
         }
-        if (run.role !== 'validator') {
+        // Validation commands and the backlog chat don't take an agent slot: the chat has to stay responsive.
+        if (run.role !== 'validator' && run.role !== 'writer') {
           if (running >= concurrency) {
             waiting.push(run);
             continue;
@@ -259,29 +302,39 @@ export class Orchestrator {
     }
   }
 
-  /** Create the branch + worktree, stacked on an unmerged dependency when needed. */
+  /** Fetch the base branch so new branches and PR preflights start from what is on the remote right now. */
+  private async freshBase(runId: string, project: Project): Promise<string> {
+    const remote = project.pipeline.remote || 'origin';
+    const tracking = `${remote}/${project.baseBranch}`;
+    const hasRemote = await gitOk(project.path, ['config', '--get', `remote.${remote}.url`]);
+    if (!hasRemote) return project.baseBranch;
+    try {
+      await fetchBranch(project.path, remote, project.baseBranch);
+      return tracking;
+    } catch (err: any) {
+      const stale = await gitOk(project.path, ['rev-parse', '--verify', '--quiet', `refs/remotes/${tracking}`]);
+      addEvent(runId, 'warning', `Could not fetch ${tracking} (${String(err.message).split('\n')[0].slice(0, 200)}); using ${stale ? `the last fetched ${tracking}` : `the local ${project.baseBranch}`}`);
+      return stale ? tracking : project.baseBranch;
+    }
+  }
+
+  /**
+   * Create the ticket's branch and worktree from the fresh base branch. One ticket = one branch = one PR:
+   * branches are never stacked on another ticket's branch (dependencies wait in the queue until they are Done).
+   */
   private async ensureWorktree(runId: string, feature: Feature, project: Project): Promise<{ branch: string; worktreePath: string; baseRef: string }> {
-    let { branch, worktreePath } = feature;
+    const { branch, worktreePath } = feature;
     if (branch && worktreePath && fs.existsSync(worktreePath)) {
       addEvent(runId, 'lifecycle', `Reusing existing worktree ${worktreePath} (branch ${branch})`);
       return { branch, worktreePath, baseRef: feature.baseRef || project.baseBranch };
     }
     if (branch && worktreePath) addEvent(runId, 'warning', `Previous worktree ${worktreePath} no longer exists; creating a new one`);
-    const deps = await Promise.all(
-      dependencyRefs(feature.id).map(async (d) => {
-        const dep = getFeatureSafe(d.id);
-        const depBranch = dep?.branch ?? null;
-        return { title: d.title, branch: depBranch, merged: depBranch ? await isMerged(project.path, depBranch, project.baseBranch) : true };
-      }),
-    );
-    const choice = chooseBaseRef(project.baseBranch, deps);
-    if ('error' in choice) throw new Error(choice.error);
-    const alloc = await allocateBranchAndPath(project.path, project.worktreeRoot, feature.title, feature.id);
-    if (choice.stackedOn) addEvent(runId, 'lifecycle', `Stacking on dependency "${choice.stackedOn}" (branch ${choice.ref}, not merged into ${project.baseBranch} yet)`);
-    addEvent(runId, 'lifecycle', `Creating worktree ${alloc.worktreePath} on branch ${alloc.branch} from ${choice.ref}`);
-    await createWorktree(project.path, alloc.worktreePath, alloc.branch, choice.ref);
-    patchFeatureState(feature.id, { branch: alloc.branch, worktreePath: alloc.worktreePath, baseRef: choice.ref });
-    return { ...alloc, baseRef: choice.ref };
+    const baseRef = await this.freshBase(runId, project);
+    const alloc = await allocateBranchAndPath(project.path, project.worktreeRoot, feature.title, feature.id, feature.issueNumber);
+    addEvent(runId, 'lifecycle', `Creating worktree ${alloc.worktreePath} on branch ${alloc.branch} from ${baseRef}`);
+    await createWorktree(project.path, alloc.worktreePath, alloc.branch, baseRef);
+    patchFeatureState(feature.id, { branch: alloc.branch, worktreePath: alloc.worktreePath, baseRef });
+    return { ...alloc, baseRef };
   }
 
   private async start(runId: string) {
@@ -302,7 +355,11 @@ export class Orchestrator {
       if (resumesSession && (!feature.worktreePath || !fs.existsSync(feature.worktreePath))) {
         throw new Error('Cannot continue: the worktree is missing');
       }
-      const { branch, worktreePath, baseRef } = await this.ensureWorktree(runId, feature, project);
+      // The backlog chat reads the main checkout; every build step works in the ticket's own worktree.
+      const isRefine = run.kind === 'refine';
+      const { branch, worktreePath, baseRef } = isRefine
+        ? { branch: '', worktreePath: project.path, baseRef: project.baseBranch }
+        : await this.ensureWorktree(runId, feature, project);
       feature = getFeature(feature.id);
       if (this.wasCancelledMeanwhile(runId)) return;
 
@@ -341,6 +398,24 @@ export class Orchestrator {
         case 'test':
           prompt = buildTesterPrompt(feature, project, branch, baseRef, cfg);
           break;
+        case 'preflight':
+          await this.freshBase(runId, project);
+          prompt = buildPreflightPrompt(feature, project, branch, cfg);
+          resume = feature.sessionId;
+          break;
+        case 'refine': {
+          resume = chatSessionId(feature.id);
+          if (resume && run.message) prompt = buildRefineReplyPrompt(run.message, feature);
+          else {
+            resume = null;
+            const history = listChat(feature.id).filter((m) => m.role !== 'system');
+            const others = listFeatures(project.id)
+              .filter((f) => f.id !== feature.id && f.issueNumber)
+              .map((f) => ({ issueNumber: f.issueNumber!, title: f.title, status: f.status }));
+            prompt = buildRefinePrompt(feature, project, history, others, cfg);
+          }
+          break;
+        }
         case 'review':
           prompt = buildReviewerPrompt(feature, project, branch, baseRef, cfg);
           break;
@@ -381,7 +456,7 @@ export class Orchestrator {
         pid,
         logDir,
         logOffset: 0,
-        stage: run.role === 'reviewer' ? 'reviewing' : run.role === 'tester' ? 'testing' : 'planning',
+        stage: run.role === 'reviewer' ? 'reviewing' : run.role === 'tester' || run.kind === 'preflight' ? 'testing' : 'planning',
         currentActivity: 'Starting Claude Code',
         model: cfg.model || null,
       });
@@ -659,7 +734,9 @@ export class Orchestrator {
     });
     addEvent(run.id, status === 'failed' ? 'error' : 'lifecycle', `Run ${status}${error ? `: ${error.split('\n')[0]}` : ''}`);
 
-    if (feature && feature.currentRunId === run.id) {
+    if (feature && run.kind === 'refine') {
+      this.finishRefine(run, feature, status, report?.self ?? null, parser.sessionId, error);
+    } else if (feature && feature.currentRunId === run.id) {
       patchFeatureState(feature.id, {
         agentStatus: status,
         sessionId: sessionOwner(run.role) ? parser.sessionId ?? feature.sessionId : feature.sessionId,
@@ -670,6 +747,50 @@ export class Orchestrator {
       if (status !== 'cancelled') this.advance(feature.id, run.id);
     }
     this.tick();
+  }
+
+  /** A writer run ended: post its reply and decision cards in the chat, store the draft, publish the issue when it is ready. */
+  private finishRefine(run: RunRow, feature: Feature, status: AgentStatus, self: AgentSelfReport | null, sessionId: string | null, error: string | null) {
+    const current = feature.currentRunId === run.id;
+    // Back to idle: a Backlog card has no pipeline state. A failure stays visible so it can be retried.
+    patchFeatureState(feature.id, { ...(sessionId ? { chatSessionId: sessionId } : {}), ...(current ? { agentStatus: status === 'completed' ? null : status } : {}) });
+    if (status === 'cancelled') return;
+    if (status !== 'completed' || !self) {
+      addChatMessage(feature.id, 'system', `The writer agent failed: ${(error ?? 'no report').split('\n')[0]}. Send your message again or click Retry.`, { runId: run.id });
+      notify({ title: 'Writing the issue failed', body: feature.title, level: 'error', featureId: feature.id, projectId: feature.projectId });
+      return;
+    }
+    const decisions = self.decisions.map((d) => ({ ...d, answer: null }));
+    addChatMessage(feature.id, 'assistant', self.reply || self.summary || 'I updated the draft.', { decisions, runId: run.id });
+    if (!self.issue) return;
+    // Until the issue exists on GitHub, the draft is the ticket's text.
+    patchFeatureState(feature.id, {
+      draft: self.issue,
+      ...(feature.issueNumber ? {} : { title: self.issue.title || feature.title, description: self.issue.body || feature.description }),
+    });
+    if (decisions.length) {
+      notify({ title: decisions.length === 1 ? 'A decision is waiting for you' : `${decisions.length} decisions are waiting for you`, body: feature.title, level: 'attention', featureId: feature.id, projectId: feature.projectId });
+      return;
+    }
+    if (!self.issue.ready) return;
+    if (!getToken()) {
+      addChatMessage(feature.id, 'system', 'The draft is ready. Add a GitHub token in Settings → GitHub to create the issue.');
+      return;
+    }
+    publishIssue(feature.id).catch((err) => {
+      addChatMessage(feature.id, 'system', `Could not save the issue on GitHub: ${err.message}`);
+      notify({ title: 'Saving the issue on GitHub failed', body: `${feature.title}: ${err.message}`, level: 'error', featureId: feature.id, projectId: feature.projectId });
+    });
+  }
+
+  /** Post the planner's plan on the GitHub issue (the issue is where the plan lives). Best effort. */
+  private postPlan(feature: Feature, project: Project, runId: string, plan: string) {
+    if (!plan.trim() || !feature.issueNumber || !project.pipeline.postPlanToIssue || !getToken()) return;
+    const issue = feature.issueNumber;
+    projectRepo(project)
+      .then((repo) => commentOnIssue(repo, issue, `## Implementation plan\n\n${plan.trim().slice(0, 60000)}\n\n_Planned by the planner agent on branch \`${feature.branch ?? ''}\`._`))
+      .then(() => addEvent(runId, 'lifecycle', `Plan posted on issue #${issue}`))
+      .catch((err) => addEvent(runId, 'warning', `Could not post the plan on issue #${issue}: ${err.message}`));
   }
 
   /** Decide and apply the next pipeline step after a run finished. Never throws: a failure is shown on the card. */
@@ -713,6 +834,7 @@ export class Orchestrator {
         status: r.status,
         fixReason: r.fixReason,
         questions: self?.needsClarification ?? [],
+        options: self?.clarificationOptions ?? [],
         plan: self?.plan ?? '',
         review: self?.review ?? null,
         validation: r.validation,
@@ -721,6 +843,9 @@ export class Orchestrator {
     const hasValidationCommands = resolveValidationCommands(project.pipeline.validationCommands, feature.worktreePath).commands.length > 0;
     const decision = nextStep({ config: project.pipeline, hasValidationCommands }, history);
     const last = history[history.length - 1];
+    if (run.role === 'planner' && run.status === 'completed' && last.plan && !last.questions.length && (decision.type === 'run' || decision.type === 'gate')) {
+      this.postPlan(feature, project, runId, last.plan);
+    }
 
     switch (decision.type) {
       case 'run': {
@@ -760,20 +885,39 @@ export class Orchestrator {
     }
   }
 
-  /** Pipeline finished (or the user approved it): move to Done and optionally open a PR. */
+  /**
+   * Pipeline finished (or the user approved it): push the branch, open the pull request and move the card
+   * to PR Open. The card reaches Done only when the PR is merged (see issues.ts `refreshPr`).
+   * Without a token, or with automatic PRs off, the card waits in Build for "Create PR".
+   */
   private complete(featureId: string) {
     const feature = patchFeatureState(featureId, { gate: null, agentStatus: 'completed' });
-    if (feature.status !== 'done') moveFeature(featureId, 'done');
-    if (feature.currentRunId) addEvent(feature.currentRunId, 'lifecycle', 'Pipeline complete; feature moved to Done');
-    notify({ title: 'Feature done', body: feature.title, level: 'success', featureId, projectId: feature.projectId });
     const project = getProject(feature.projectId);
-    if (project.pipeline.autoCreatePr && getToken() && !feature.prUrl) {
-      createPrForFeature(featureId).catch((err) => {
-        if (feature.currentRunId) addEvent(feature.currentRunId, 'error', `Automatic pull request failed: ${err.message}`);
-        notify({ title: 'Pull request failed', body: `${feature.title}: ${err.message}`, level: 'error', featureId, projectId: feature.projectId });
-      });
+    const runId = feature.currentRunId;
+    if (!project.pipeline.autoCreatePr || !getToken()) {
+      const why = project.pipeline.autoCreatePr ? 'No GitHub token: add one in Settings → GitHub, then click Create PR.' : 'Click Create PR to open the pull request.';
+      if (runId) {
+        updateRun(runId, { currentActivity: 'Ready for a pull request' });
+        addEvent(runId, 'lifecycle', `Pipeline complete. ${why}`);
+      }
+      notify({ title: 'Ready for a pull request', body: feature.title, level: 'attention', featureId, projectId: feature.projectId });
+      this.tick();
+      return;
     }
-    this.tick();
+    if (runId) {
+      updateRun(runId, { currentActivity: 'Opening the pull request' });
+      addEvent(runId, 'lifecycle', 'Pipeline complete; opening the pull request');
+    }
+    createPrForFeature(featureId)
+      .then(() => runId && updateRun(runId, { currentActivity: 'Pull request open' }))
+      .catch((err) => {
+        if (runId) {
+          updateRun(runId, { currentActivity: 'Pull request failed' });
+          addEvent(runId, 'error', `Pull request failed: ${err.message}. Fix the cause, then click Create PR.`);
+        }
+        notify({ title: 'Pull request failed', body: `${feature.title}: ${err.message}`, level: 'error', featureId, projectId: feature.projectId });
+      })
+      .finally(() => this.tick());
   }
 
   private finishWithoutProcess(run: RunRow, status: AgentStatus, error: string) {

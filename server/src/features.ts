@@ -3,10 +3,38 @@ import { bus } from './events.ts';
 import { HttpError, getProject } from './projects.ts';
 import { getRun, publicRun } from './runs.ts';
 import { findCycle, type DepGraph } from './dependencies.ts';
-import type { AgentStatus, DependencyRef, Feature, FeatureStatus, Gate, Priority } from '../../shared/types.ts';
+import { FEATURE_STATUSES, type AgentStatus, type DependencyRef, type Feature, type FeatureStatus, type Gate, type HumanAction, type IssueDraft, type PrInfo, type Priority } from '../../shared/types.ts';
 
 const PRIORITIES: Priority[] = ['low', 'medium', 'high'];
-const STATUSES: FeatureStatus[] = ['backlog', 'build', 'done'];
+const STATUSES: FeatureStatus[] = FEATURE_STATUSES;
+
+function parseJson<T>(s: string | null | undefined, fallback: T): T {
+  try {
+    return s ? (JSON.parse(s) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** T-shirt size from a `size: M` / `size/M` label, else from a "Size: M" line in the issue body. */
+export function sizeOf(labels: string[], body: string): string | null {
+  for (const l of labels) {
+    const m = /^size\s*[:/\- ]\s*(XS|S|M|L|XL)$/i.exec(l.trim());
+    if (m) return m[1].toUpperCase();
+  }
+  const m = /^\W*size\W*[:\n]\s*\W*(XS|S|M|L|XL)\b/im.exec(body);
+  return m ? m[1].toUpperCase() : null;
+}
+
+/** Issue numbers named on "Depends on #12, #13" lines of an issue body. */
+export function dependsOnIssues(body: string): number[] {
+  const out = new Set<number>();
+  for (const line of body.split('\n')) {
+    if (!/depends on|blocked by/i.test(line)) continue;
+    for (const m of line.matchAll(/#(\d+)/g)) out.add(Number(m[1]));
+  }
+  return [...out];
+}
 
 function rowToFeature(r: any): Feature {
   const f: Feature = {
@@ -28,6 +56,15 @@ function rowToFeature(r: any): Feature {
     baseRef: r.base_ref ?? null,
     prUrl: r.pr_url ?? null,
     prNumber: r.pr_number ?? null,
+    issueNumber: r.issue_number ?? null,
+    issueUrl: r.issue_url ?? null,
+    issueState: r.issue_state ?? null,
+    labels: parseJson<string[]>(r.labels_json, []),
+    size: null,
+    humanActions: parseJson<HumanAction[]>(r.human_actions_json, []),
+    pr: parseJson<PrInfo | null>(r.pr_json, null),
+    draft: parseJson<IssueDraft | null>(r.draft_json, null),
+    openDecisions: 0,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -39,6 +76,11 @@ function rowToFeature(r: any): Feature {
     )
     .get(f.id) as { runs: number; cost: number; tokens: number };
   f.totals = { runs: t.runs, costUsd: t.cost, newTokens: t.tokens };
+  f.size = sizeOf(f.labels, f.description) ?? (f.draft?.size || null);
+  if (f.status === 'backlog') {
+    const last = getDb().prepare("SELECT decisions_json FROM chat_messages WHERE feature_id = ? AND role = 'assistant' ORDER BY created_at DESC, rowid DESC LIMIT 1").get(f.id) as { decisions_json: string } | undefined;
+    f.openDecisions = parseJson<{ answer: string | null }[]>(last?.decisions_json, []).filter((d) => d.answer === null).length;
+  }
   const deps = dependencyRefs(f.id);
   f.dependsOn = deps.map((d) => d.id);
   f.blockedBy = deps.filter((d) => d.status !== 'done');
@@ -126,6 +168,40 @@ export interface FeatureInput {
   priority?: Priority;
 }
 
+/** A ticket that exists only in memory (launch previews, tests). */
+export function blankFeature(over: Partial<Feature> = {}): Feature {
+  return {
+    id: 'ftr_blank', projectId: '', title: '', description: '', priority: 'medium', status: 'backlog', position: 0,
+    branch: null, worktreePath: null, sessionId: null, agentStatus: null, currentRunId: null, dependsOn: [], blockedBy: [], gate: null, baseRef: null,
+    prUrl: null, prNumber: null, issueNumber: null, issueUrl: null, issueState: null, labels: [], size: null, humanActions: [], pr: null, draft: null,
+    openDecisions: 0, createdAt: '', updatedAt: '',
+    ...over,
+  };
+}
+
+export function chatSessionId(featureId: string): string | null {
+  return (getDb().prepare('SELECT chat_session_id AS s FROM features WHERE id = ?').get(featureId) as { s: string | null } | undefined)?.s ?? null;
+}
+
+export function findByIssue(projectId: string, issueNumber: number): Feature | null {
+  const r = getDb().prepare('SELECT * FROM features WHERE project_id = ? AND issue_number = ?').get(projectId, issueNumber);
+  return r ? rowToFeature(r) : null;
+}
+
+/** Set the dependencies named in the issue text: the tickets behind these issue numbers (unknown numbers and cycles are skipped). */
+export function setDependenciesByIssue(featureId: string, issueNumbers: number[]) {
+  // No "Depends on" line in the issue: keep whatever was linked by hand on the board.
+  if (!issueNumbers.length) return;
+  const f = getFeature(featureId);
+  const ids = issueNumbers.map((n) => findByIssue(f.projectId, n)?.id).filter((x): x is string => !!x && x !== featureId);
+  if (ids.length === f.dependsOn.length && ids.every((id) => f.dependsOn.includes(id))) return;
+  try {
+    setDependencies(featureId, ids);
+  } catch {
+    /* a cycle in the issue text: keep the current dependencies */
+  }
+}
+
 export function createFeature(projectId: string, input: FeatureInput): Feature {
   getProject(projectId);
   const title = input.title?.trim();
@@ -167,7 +243,19 @@ export interface FeatureStatePatch {
   baseRef?: string | null;
   prUrl?: string | null;
   prNumber?: number | null;
+  title?: string;
+  description?: string;
+  issueNumber?: number | null;
+  issueUrl?: string | null;
+  issueState?: 'open' | 'closed' | null;
+  labels?: string[];
+  humanActions?: HumanAction[];
+  pr?: PrInfo | null;
+  draft?: IssueDraft | null;
+  chatSessionId?: string | null;
 }
+
+const JSON_COLS = new Set<keyof FeatureStatePatch>(['gate', 'labels', 'humanActions', 'pr', 'draft']);
 
 const COLS: Record<keyof FeatureStatePatch, string> = {
   gate: 'gate_json',
@@ -181,6 +269,16 @@ const COLS: Record<keyof FeatureStatePatch, string> = {
   sessionId: 'session_id',
   agentStatus: 'agent_status',
   currentRunId: 'current_run_id',
+  title: 'title',
+  description: 'description',
+  issueNumber: 'issue_number',
+  issueUrl: 'issue_url',
+  issueState: 'issue_state',
+  labels: 'labels_json',
+  humanActions: 'human_actions_json',
+  pr: 'pr_json',
+  draft: 'draft_json',
+  chatSessionId: 'chat_session_id',
 };
 
 export function patchFeatureState(id: string, patch: FeatureStatePatch, opts: { silent?: boolean } = {}): Feature {
@@ -190,7 +288,7 @@ export function patchFeatureState(id: string, patch: FeatureStatePatch, opts: { 
     if (v === undefined) continue;
     if (k === 'status' && !STATUSES.includes(v as FeatureStatus)) throw new HttpError(400, 'Invalid status');
     sets.push(`${COLS[k]}=?`);
-    vals.push(k === 'gate' ? (v ? JSON.stringify(v) : null) : v);
+    vals.push(JSON_COLS.has(k) ? (v === null ? (k === 'labels' || k === 'humanActions' ? '[]' : null) : JSON.stringify(v)) : v);
   }
   sets.push('updated_at=?');
   vals.push(now());

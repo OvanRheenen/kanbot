@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import type { AppNotification, Feature, Project, Run, RunEvent, ServerMessage, Settings } from '@shared/types.ts';
+import type { AppNotification, ChatMessage, Feature, Project, Run, RunEvent, ServerMessage, Settings } from '@shared/types.ts';
 
 export type TerminalMessage = Extract<ServerMessage, { type: 'terminal.updated' | 'terminal.output' }>;
 import { api, type SettingsResponse } from './api';
@@ -18,6 +18,15 @@ const eventListeners = new Set<(e: RunEvent) => void>();
 const runListeners = new Set<(r: Run) => void>();
 const notificationListeners = new Set<(n: AppNotification) => void>();
 const terminalListeners = new Set<(m: TerminalMessage) => void>();
+const chatListeners = new Set<(m: ChatMessage) => void>();
+
+/** Backlog chat messages (new, or updated when a decision card is answered); not stored globally. */
+export function onChatMessage(fn: (m: ChatMessage) => void) {
+  chatListeners.add(fn);
+  return () => {
+    chatListeners.delete(fn);
+  };
+}
 
 /** Terminal tab messages (`terminal.updated` / `terminal.output`); not stored globally. */
 export function onTerminal(fn: (m: TerminalMessage) => void) {
@@ -132,6 +141,9 @@ function handle(msg: ServerMessage) {
       break;
     case 'notification':
       notificationListeners.forEach((l) => l(msg.notification));
+      break;
+    case 'chat.message':
+      chatListeners.forEach((l) => l(msg.message));
       break;
     case 'terminal.updated':
     case 'terminal.output':

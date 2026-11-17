@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { SlidersHorizontal } from 'lucide-react';
+import { Sparkles, SlidersHorizontal } from 'lucide-react';
 import type { Priority } from '@shared/types.ts';
 import { api } from '@/api';
 import { upsertFeature } from '@/store';
@@ -25,12 +25,14 @@ export function FeatureComposer({ projectId, onMore }: { projectId: string; onMo
   const [priority, setPriority] = useState<Priority>('medium');
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
+  // On: the text opens a chat with the writer agent, who turns it into the GitHub issue. Off: the ticket is created as typed.
+  const [brainstorm, setBrainstorm] = useState(true);
 
   const submit = async () => {
     if (!title.trim() || saving) return;
     setSaving(true);
     try {
-      upsertFeature(await api.createFeature(projectId, { title: title.trim(), description, priority }));
+      upsertFeature(await api.createFeature(projectId, { title: title.trim(), description, priority, brainstorm }));
       setTitle('');
       setDescription('');
       setExpanded(false);
@@ -79,11 +81,23 @@ export function FeatureComposer({ projectId, onMore }: { projectId: string; onMo
       onSend={submit}
       canSend={!!title.trim()}
       sending={saving}
-      sendLabel="Add to backlog"
+      sendLabel={brainstorm ? 'Brainstorm with Claude' : 'Add to backlog as written'}
       footerLeft={
-        <Button type="button" variant="ghost" size="pill" onClick={onMore} title="Open the full feature form (dependencies…)">
-          <SlidersHorizontal /> More options
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            type="button"
+            variant={brainstorm ? 'secondary' : 'ghost'}
+            size="pill"
+            aria-pressed={brainstorm}
+            onClick={() => setBrainstorm((b) => !b)}
+            title={brainstorm ? 'Claude reads the code and writes the issue with you. Click to add the ticket exactly as typed instead.' : 'The ticket is added exactly as typed. Click to let Claude write the issue with you.'}
+          >
+            <Sparkles /> {brainstorm ? 'Brainstorm' : 'As written'}
+          </Button>
+          <Button type="button" variant="ghost" size="pill" onClick={onMore} title="Open the full ticket form (dependencies…)">
+            <SlidersHorizontal /> More
+          </Button>
+        </div>
       }
     >
       <input
@@ -91,8 +105,8 @@ export function FeatureComposer({ projectId, onMore }: { projectId: string; onMo
         onChange={(e) => setTitle(e.target.value)}
         onFocus={() => setExpanded(true)}
         onKeyDown={onKeyDown}
-        placeholder="Quick add a feature…"
-        aria-label="Feature title"
+        placeholder="New ticket: what do you want?"
+        aria-label="Ticket title"
         className="w-full bg-transparent text-sm font-medium outline-none placeholder:font-normal placeholder:text-muted-foreground/80"
       />
       {expanded && (
@@ -101,7 +115,7 @@ export function FeatureComposer({ projectId, onMore }: { projectId: string; onMo
           value={description}
           onChange={setDescription}
           onKeyDown={onKeyDown}
-          placeholder="Details, acceptance criteria, @files… (optional)"
+          placeholder="Rough notes, context, @files… (optional)"
           rows={2}
           className={composerTextareaClass}
         />

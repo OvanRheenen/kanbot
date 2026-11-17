@@ -7,6 +7,8 @@ export interface StepRun {
   status: AgentStatus;
   fixReason: FixReason | null;
   questions: string[];
+  /** Suggested answers per question. */
+  options?: string[][];
   plan: string;
   review: ReviewResult | null;
   validation: ValidationResult[] | null;
@@ -48,6 +50,9 @@ export function nextStep(ctx: PipelineContext, runs: StepRun[]): Decision {
     return { type: 'idle' };
   }
 
+  // Backlog chat runs never drive the pipeline.
+  if (last.role === 'writer' || last.kind === 'refine') return { type: 'idle' };
+
   if (last.role === 'validator') {
     if (last.status === 'completed' && validationPassed(last.validation)) return afterValidated(ctx, runs);
     if (last.status === 'failed' && !last.validation?.length) return { type: 'stop', error: 'Validation could not run' };
@@ -62,7 +67,7 @@ export function nextStep(ctx: PipelineContext, runs: StepRun[]): Decision {
   if (last.status === 'failed') return { type: 'stop', error: '' };
 
   if (last.questions.length) {
-    return { type: 'gate', gate: { type: 'clarification', questions: last.questions, role: last.role } };
+    return { type: 'gate', gate: { type: 'clarification', questions: last.questions, options: last.options, role: last.role } };
   }
 
   switch (last.role) {
@@ -73,15 +78,15 @@ export function nextStep(ctx: PipelineContext, runs: StepRun[]): Decision {
     case 'tester':
       return afterChange(ctx, runs);
     case 'reviewer': {
-      if (last.review?.verdict !== 'changes_requested') return finish(config);
+      if (last.review?.verdict !== 'changes_requested') return beforeFinish(config, runs);
       const fixes = countFixes(runs, 'review');
-      if (fixes < config.maxFixLoops) {
-        return { type: 'run', kind: 'fix', role: 'developer', fixReason: 'review', reason: `Reviewer requested changes; developer fix ${fixes + 1}/${config.maxFixLoops}` };
+      if (fixes < config.maxReviewLoops) {
+        return { type: 'run', kind: 'fix', role: 'developer', fixReason: 'review', reason: `Reviewer requested changes; developer fix ${fixes + 1}/${config.maxReviewLoops}` };
       }
       if (config.finalApproval) {
         return { type: 'gate', gate: { type: 'final_approval', note: `The reviewer still requests changes after ${fixes} fix round(s). Approve anyway or request changes.` } };
       }
-      return { type: 'stop', error: `The reviewer still requests changes after ${fixes} fix round(s). See the Review, then Retry, send a follow-up, or fix it yourself.` };
+      return { type: 'stop', error: `Needs a human: the reviewer still requests changes after ${fixes} fix round(s). See the Review, then Retry, send a follow-up, or fix it yourself.` };
     }
   }
   return { type: 'idle' };
@@ -98,7 +103,17 @@ function afterValidated(ctx: PipelineContext, runs: StepRun[]): Decision {
   if (config.tester && !runs.some((r) => r.role === 'tester' && r.status === 'completed')) {
     return { type: 'run', kind: 'test', role: 'tester', reason: 'Tester agent adds and runs tests' };
   }
+  // After the PR preflight only validation runs again: the reviewed code is not reviewed twice.
+  if (preflightDone(runs)) return finish(config);
   if (config.reviewer) return { type: 'run', kind: 'review', role: 'reviewer', reason: 'Reviewer agent reviews the changes' };
+  return beforeFinish(config, runs);
+}
+
+const preflightDone = (runs: StepRun[]) => runs.some((r) => r.kind === 'preflight' && r.status === 'completed');
+
+/** Review passed (or is off): run the PR preflight once per cycle, then finish. */
+function beforeFinish(config: PipelineConfig, runs: StepRun[]): Decision {
+  if (config.preflight && !preflightDone(runs)) return { type: 'run', kind: 'preflight', role: 'developer', reason: 'Review passed; preparing the pull request' };
   return finish(config);
 }
 
@@ -113,6 +128,8 @@ export function stepLabel(kind: RunKind, role: AgentRole, fixReason: FixReason |
   if (role === 'validator') return 'Validating';
   if (role === 'tester') return 'Testing';
   if (role === 'reviewer') return 'Reviewing';
+  if (role === 'writer') return 'Writing the issue';
+  if (kind === 'preflight') return 'PR preflight';
   if (kind === 'fix') return fixReason === 'validation' ? 'Fixing validation' : fixReason === 'review' ? 'Addressing review' : 'Applying feedback';
   if (kind === 'followup') return 'Follow-up';
   return 'Developing';

@@ -11,7 +11,7 @@ Source files: `server/src/db.ts`, `server/src/runs.ts`, `shared/types.ts` (row m
 **Migrations** (db.ts:18-124):
 - `MIGRATIONS` is an **append-only** array of SQL strings, versioned with `PRAGMA user_version`.
 - `migrate()` (db.ts:136) runs each pending entry in BEGIN/COMMIT, then sets `user_version=i+1`, and rolls back on error.
-- Current version: **5**. To change the schema, append a new entry, then update this doc.
+- Current version: **6**. To change the schema, append a new entry, then update this doc.
 
 **Helpers:**
 - `getDb()` (db.ts:126) is a lazy singleton; `closeDb()` (db.ts:152) is for tests.
@@ -20,7 +20,7 @@ Source files: `server/src/db.ts`, `server/src/runs.ts`, `shared/types.ts` (row m
 - `tx(fn)` (db.ts:165) wraps `fn` in `BEGIN IMMEDIATE`.
 - JSON columns are parsed defensively (`safeJson`, `safeJsonArray`).
 
-## Schema (after migration 5)
+## Schema (after migration 6)
 
 **projects**
 
@@ -42,6 +42,7 @@ Source files: `server/src/db.ts`, `server/src/runs.ts`, `shared/types.ts` (row m
 | `roles_json` | default `'{}'` | m4 |
 | `mcp_servers_json` | default `'[]'` | m5 |
 | `skills_json` | default `'[]'` | m5 |
+| `repo_slug` | `owner/repo` on GitHub, filled by the first sync or PR | m6 |
 
 **features**
 
@@ -59,8 +60,14 @@ Source files: `server/src/db.ts`, `server/src/runs.ts`, `shared/types.ts` (row m
 | `gate_json` | | m4 |
 | `base_ref` | | m4 |
 | `pr_url`, `pr_number` | | m4 |
+| `issue_number`, `issue_url`, `issue_state` | The GitHub issue behind the ticket (null = local draft) | m6 |
+| `labels_json` | Issue labels | m6 |
+| `human_actions_json` | `HumanAction[]` | m6 |
+| `pr_json` | `PrInfo` (state, draft, checks, labels, syncedAt) | m6 |
+| `chat_session_id` | Claude Code session of the backlog chat (writer) | m6 |
+| `draft_json` | Latest `IssueDraft` from the writer | m6 |
 
-Index: `features_project(project_id, status, position)`.
+Indexes: `features_project(project_id, status, position)`; unique `features_issue(project_id, issue_number)` where the issue number is set (m6).
 
 **runs**
 
@@ -93,6 +100,7 @@ Index: `runs_feature(feature_id, attempt)`.
 
 **Other tables**
 - **run_events** (m1): `id` INTEGER PK AUTOINCREMENT, `run_id` FK cascade, `ts`, `kind`, `summary`, `detail`. Index `run_events_run(run_id, id)`.
+- **chat_messages** (m6): `id`, `feature_id` FK cascade, `role` (`user|assistant|system`), `text`, `decisions_json` (`DecisionCard[]`), `run_id`, `created_at`. Index `chat_messages_feature(feature_id, created_at)`. Access: `server/src/chat.ts`.
 - **settings** (m1): `key` PK, `value` (JSON-encoded).
 - **feature_dependencies** (m4): `feature_id`, `depends_on_id` (both FK → features, cascade); PK is the pair; index on `depends_on_id`.
 
@@ -116,10 +124,10 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
 ## Key types (`shared/types.ts`)
 
 **Versioning**
-- `API_VERSION = 9` (line 7; 9 made `cd` persist in the Terminal tab: `endCwd`, `TerminalState` and `DELETE /features/:id/terminal/cwd`; 8 added the Terminal tab: `TerminalSession`, the `terminal.*` WS messages and `/features/:id/terminal` endpoints; 7 added `autoStartBuild`, `pipeline.autoStart` and `POST /features/:id/start`). Bump it when the backend and dashboard must change together.
+- `API_VERSION = 10` (10 added the issue → PR workflow: the `pr_open` column, issue/PR/human-action fields on `Feature`, the backlog chat, `chat.message`; 9 made `cd` persist in the Terminal tab: `endCwd`, `TerminalState` and `DELETE /features/:id/terminal/cwd`; 8 added the Terminal tab: `TerminalSession`, the `terminal.*` WS messages and `/features/:id/terminal` endpoints; 7 added `autoStartBuild`, `pipeline.autoStart` and `POST /features/:id/start`). Bump it when the backend and dashboard must change together.
 
 **Status and role enums**
-- `FeatureStatus` = `backlog | build | done`. This is the Kanban column.
+- `FeatureStatus` = `backlog | build | pr_open | done`. This is the Kanban column (`FEATURE_STATUSES`).
 - `AgentStatus` = `queued | initialising | running | completed | failed | cancelled`.
   - `ACTIVE_AGENT_STATUSES` = the first three (line 113).
 - `AgentProfile` = `lean | full`.
@@ -136,9 +144,12 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
   | `validate` | Commands only, no agent |
   | `answer` | Resume after the user answers |
   | `followup` | New cycle |
+  | `refine` | Backlog chat: the writer drafts the issue (cycle 0, main checkout, read-only) |
+  | `preflight` | Developer prepares the pull request |
 
-- `AgentRole` = `planner | developer | tester | reviewer | validator`.
-  - `ClaudeRole` excludes `validator`; `CLAUDE_ROLES` lists the four Claude roles.
+- `AgentRole` = `planner | developer | tester | reviewer | validator | writer`.
+  - `ROLE_DEFAULT_MODEL`: writer/planner/reviewer `opus`, developer/tester `sonnet` (used when the role, project and global settings name no model).
+  - `ClaudeRole` excludes `validator`; `CLAUDE_ROLES` lists the five Claude roles.
 - `FixReason` = `validation | review | user`.
 
 **Configuration**
@@ -146,14 +157,15 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
   - `plan`, `planApproval`
   - `validate`, `validationCommands` (`[]` means auto-detect)
   - `tester`, `reviewer`, `finalApproval`
-  - `maxFixLoops` (per fix reason)
+  - `maxFixLoops` (validation fixes), `maxReviewLoops` (review ⇄ fix rounds)
+  - `preflight`, `postPlanToIssue`, `assignPr`, `prReviewers[]`, `humanActionRules[]` (`{pattern, label, detail, doneLabel}`)
   - `autoCreatePr`, `prDraft`, `remote`
   - `autoStart: boolean | null` (`null` = use the global `Settings.autoStartBuild`)
 - `RoleConfig {model, effort}` (`''` = inherit). `RolesConfig` = `Partial<Record<ClaudeRole, RoleConfig>>`.
 
 **Gates and results**
 - `GateType` = `plan_approval | clarification | final_approval`.
-- `Gate {type, runId, openedAt, plan?, questions?, role?, note?}`.
+- `Gate {type, runId, openedAt, plan?, questions?, options?, role?, note?}` (`options[i]` = suggested answers for `questions[i]`).
 - `ValidationResult {command, exitCode, durationMs, timedOut, output (tail)}`.
 - `ReviewFinding {severity: blocker|major|minor|nit, file, line|null, message}`.
 - `ReviewResult {verdict: approve|changes_requested, summary, findings}`.
@@ -167,6 +179,8 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
 - `Feature`:
   - Card: `id`, `projectId`, `title`, `description`, `priority`, `status`, `position`.
   - Git and session: `branch`, `worktreePath`, `sessionId`, `baseRef`, `prUrl`, `prNumber`.
+  - GitHub: `issueNumber`, `issueUrl`, `issueState`, `labels[]`, `size` (computed from a `size: M` label or a "Size: M" line), `pr: PrInfo | null`, `humanActions: HumanAction[]`.
+  - Backlog chat: `draft: IssueDraft | null`, `openDecisions` (computed: unanswered decision cards on the last assistant message).
   - Pipeline state: `agentStatus`, `currentRunId`, `gate`.
   - Dependencies: `dependsOn[]`, `blockedBy[]` (computed: dependencies not Done).
   - Joined extras: `totals? {runs, costUsd, newTokens}`, `run?` (the current run).
@@ -182,7 +196,8 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
 
 **Reports and changes**
 - `Changes {branch, baseBranch, worktreePath, headCommit, commits, files: FileChange[], hasUncommittedChanges, worktreeExists}`.
-- `AgentSelfReport {summary, implementationDetails, tests, build, outstandingIssues, docsUpdated, plan, needsClarification, review, reported}`.
+- `AgentSelfReport {summary, implementationDetails, tests, build, outstandingIssues, docsUpdated, plan, needsClarification, clarificationOptions, reply, decisions, issue, prTitle, prBody, humanActions, review, reported}`.
+- `HumanAction {id, source: rule|agent|tests|github, label, detail, done}`, `PrInfo {state: open|closed|merged, draft, checks: pending|passing|failing|null, labels, syncedAt}`, `IssueDraft {title, body, labels, size, dependsOn, ready}`, `DecisionCard {id, question, options[{label, description}], answer}`, `ChatMessage {id, featureId, role, text, decisions, runId, createdAt}`.
 - `Report {runId, featureId, generatedAt, status, self, changes, usage, estimatedCostUsd, reportedCostUsd, durationMs, model, metrics?, kind?, role?, markdown}`.
 - Diff types: `DiffLine` (`context|add|del|meta`, `oldNo`, `newNo`), `DiffHunk`, `DiffFile` (`status`, `additions`, `deletions`, `binary`, `truncated`), `DiffResult {scope, base, files, truncated}`.
 
@@ -199,4 +214,5 @@ Deleting a project cascades to its features, runs, run_events and dependencies.
 
 - Card `position` is a REAL in steps of 1000; an empty column starts at 1000.
 - Moving a card puts it at the bottom of the column, except **Done**, where it goes to the **top**.
+- Tickets imported by a sync are created in issue-number order.
 - `reorderFeatures` rewrites positions to `(i+1)*1000`.

@@ -1,3 +1,4 @@
+import { blankFeature } from '../src/features.ts';
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -7,7 +8,11 @@ import { parseUnifiedDiff } from '../src/diffParse.ts';
 import { chooseBaseRef, findCycle } from '../src/dependencies.ts';
 import { parseRemote } from '../src/github.ts';
 import { DISALLOWED_FOR_READ_ONLY, buildClaudeArgs, resolveLaunchConfig } from '../src/launch.ts';
-import { DEFAULT_PIPELINE, cleanPipeline } from '../src/projects.ts';
+import { DEFAULT_PIPELINE as PROJECT_DEFAULTS, cleanPipeline } from '../src/projects.ts';
+import { ALWAYS_DENIED } from '../src/launch.ts';
+
+// The classic pipeline (plan gate, tester, no reviewer, no preflight); the new steps are tested at the end of this file.
+const DEFAULT_PIPELINE: PipelineConfig = { ...PROJECT_DEFAULTS, planApproval: true, tester: true, reviewer: false, preflight: false, maxReviewLoops: 2 };
 import { systemNotificationArgs, shouldNotify } from '../src/notify.ts';
 import { detectValidationCommands, installCommand } from '../src/validation.ts';
 import { extractSelfReport } from '../src/report.ts';
@@ -196,15 +201,15 @@ describe('github', () => {
 
 const project: Project = {
   id: 'p', name: 'Shop', description: '', path: '/r', baseBranch: 'main', worktreeRoot: '/w', allowedTools: ['Read', 'Edit', 'Bash(npm:*)'], model: 'opus',
-  agentProfile: '', effort: '', mcpConfig: '', mcpServers: [], skills: [], pipeline: DEFAULT_PIPELINE, roles: { reviewer: { model: 'sonnet', effort: 'low' } }, createdAt: '',
+  agentProfile: '', effort: '', repoSlug: '', mcpConfig: '', mcpServers: [], skills: [], pipeline: DEFAULT_PIPELINE, roles: { reviewer: { model: 'sonnet', effort: 'low' } }, createdAt: '',
 };
 const settings: Settings = {
-  concurrency: 2, agentProfile: 'lean', effort: 'medium', maxBudgetUsd: 0, defaultModel: '', editorCommand: 'vscode', claudeBinary: 'claude', notifications: 'all', systemNotifications: false, autoStartBuild: true,
+  concurrency: 2, agentProfile: 'lean', effort: 'medium', maxBudgetUsd: 0, defaultModel: '', editorCommand: 'vscode', claudeBinary: 'claude', notifications: 'all', systemNotifications: false, autoStartBuild: true, syncIntervalSec: 0,
 };
-const feature: Feature = {
+const feature: Feature = blankFeature({
   id: 'f', projectId: 'p', title: 'Export', description: 'CSV', priority: 'low', status: 'build', position: 0, branch: null, worktreePath: null, sessionId: null,
   agentStatus: null, currentRunId: null, dependsOn: [], blockedBy: [], gate: null, baseRef: null, prUrl: null, prNumber: null, createdAt: '', updatedAt: '',
-};
+});
 
 describe('roles', () => {
   it('runs planner and reviewer read-only with their own model/effort', () => {
@@ -212,12 +217,13 @@ describe('roles', () => {
     expect(rev).toMatchObject({ readOnly: true, model: 'sonnet', effort: 'low' });
     const args = buildClaudeArgs('P', rev);
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
-    expect(args[args.indexOf('--disallowedTools') + 1]).toBe(DISALLOWED_FOR_READ_ONLY.join(','));
+    expect(args[args.indexOf('--disallowedTools') + 1]).toBe([...ALWAYS_DENIED, ...DISALLOWED_FOR_READ_ONLY].join(','));
     expect(args[args.indexOf('--allowedTools') + 1]).not.toContain('Edit');
     expect(args[args.indexOf('--tools') + 1]).toBe('Read,Glob,Grep,Bash');
     const dev = resolveLaunchConfig(project, settings, 'developer');
     expect(dev).toMatchObject({ readOnly: false, model: 'opus', effort: 'medium' });
-    expect(buildClaudeArgs('P', dev)).not.toContain('--disallowedTools');
+    const devArgs = buildClaudeArgs('P', dev);
+    expect(devArgs[devArgs.indexOf('--disallowedTools') + 1]).toBe(ALWAYS_DENIED.join(','));
   });
 
   it('builds role prompts with markers and the right report fields', () => {
@@ -259,7 +265,7 @@ describe('roles', () => {
 describe('notifications', () => {
   it('escapes osascript strings and filters by level', () => {
     const args = systemNotificationArgs('Plan "ready"', 'Feature \\ x');
-    expect(args[1]).toBe('display notification "Feature \\\\ x" with title "Kanbuild" subtitle "Plan \\"ready\\""');
+    expect(args[1]).toBe('display notification "Feature \\\\ x" with title "Kanbot" subtitle "Plan \\"ready\\""');
     expect(shouldNotify('attention', 'success')).toBe(false);
     expect(shouldNotify('attention', 'error')).toBe(true);
     expect(shouldNotify('off', 'attention')).toBe(false);
@@ -306,5 +312,51 @@ describe('child environment', () => {
     } finally {
       process.env = saved;
     }
+  });
+});
+
+describe('issue → PR workflow steps', () => {
+  const flow = (p: Partial<PipelineConfig> = {}) => ({ config: { ...PROJECT_DEFAULTS, validate: false, ...p }, hasValidationCommands: false });
+  const approve = { verdict: 'approve' as const, summary: '', findings: [] };
+  const changes = { verdict: 'changes_requested' as const, summary: '', findings: [{ severity: 'major' as const, file: 'a.ts', line: 1, message: 'x' }] };
+
+  it('defaults to plan (no gate) → develop → review → preflight → done', () => {
+    expect(PROJECT_DEFAULTS).toMatchObject({ plan: true, planApproval: false, tester: false, reviewer: true, preflight: true, maxReviewLoops: 5, autoCreatePr: true, prDraft: false });
+    const plan = run({ kind: 'plan', role: 'planner', plan: 'P' });
+    expect(nextStep(flow(), [plan])).toMatchObject({ type: 'run', kind: 'feature', role: 'developer' });
+    const dev = run({});
+    expect(nextStep(flow(), [plan, dev])).toMatchObject({ type: 'run', kind: 'review', role: 'reviewer' });
+    const ok = run({ kind: 'review', role: 'reviewer', review: approve });
+    expect(nextStep(flow(), [plan, dev, ok])).toMatchObject({ type: 'run', kind: 'preflight', role: 'developer' });
+    const pre = run({ kind: 'preflight' });
+    // After the preflight the code is not reviewed again.
+    expect(nextStep(flow(), [plan, dev, ok, pre])).toEqual({ type: 'done' });
+    // With validation on, the preflight's merge is validated, and a fix after it goes straight to done.
+    const v = { config: { ...PROJECT_DEFAULTS }, hasValidationCommands: true };
+    expect(nextStep(v, [plan, dev, ok, pre])).toMatchObject({ type: 'run', kind: 'validate' });
+  });
+
+  it('loops review ⇄ fix up to maxReviewLoops, then stops for a human', () => {
+    const history = [run({})];
+    for (let i = 0; i < 5; i++) {
+      history.push(run({ kind: 'review', role: 'reviewer', review: changes }));
+      expect(nextStep(flow(), history)).toMatchObject({ type: 'run', kind: 'fix', fixReason: 'review' });
+      history.push(run({ kind: 'fix', fixReason: 'review' }));
+      expect(nextStep(flow(), history)).toMatchObject({ type: 'run', kind: 'review' });
+    }
+    history.push(run({ kind: 'review', role: 'reviewer', review: changes }));
+    const stop = nextStep(flow(), history);
+    expect(stop.type).toBe('stop');
+    expect((stop as any).error).toMatch(/Needs a human.*after 5 fix round/);
+  });
+
+  it('runs the preflight without a reviewer, asks its questions, and ignores backlog chat runs', () => {
+    expect(nextStep(flow({ reviewer: false }), [run({})])).toMatchObject({ type: 'run', kind: 'preflight' });
+    expect(nextStep(flow({ reviewer: false, preflight: false }), [run({})])).toEqual({ type: 'done' });
+    const asks = run({ kind: 'preflight', questions: ["What's new entry?"], options: [['Yes', 'No']] });
+    expect(nextStep(flow(), [run({}), asks])).toEqual({ type: 'gate', gate: { type: 'clarification', questions: ["What's new entry?"], options: [['Yes', 'No']], role: 'developer' } });
+    // The answer run finishes the preflight: no second preflight, no review.
+    expect(nextStep(flow(), [run({}), asks, run({ kind: 'answer' })])).toEqual({ type: 'done' });
+    expect(nextStep(flow(), [run({ kind: 'refine', role: 'writer' })])).toEqual({ type: 'idle' });
   });
 });

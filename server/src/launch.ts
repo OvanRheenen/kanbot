@@ -1,5 +1,5 @@
 import type { Capabilities } from './capabilities.ts';
-import type { AgentProfile, AgentRole, Effort, Project, Settings } from '../../shared/types.ts';
+import { ROLE_DEFAULT_MODEL, type AgentProfile, type AgentRole, type Effort, type Project, type Settings } from '../../shared/types.ts';
 
 /**
  * Built-in tools available to agents in the lean profile. Everything else (web tools, sub-agents,
@@ -29,7 +29,22 @@ export const READ_ONLY_ALLOWED = [
 ];
 export const DISALLOWED_FOR_READ_ONLY = ['Edit', 'Write', 'NotebookEdit'];
 
-export const isReadOnlyRole = (role: AgentRole | undefined) => role === 'planner' || role === 'reviewer';
+export const isReadOnlyRole = (role: AgentRole | undefined) => role === 'planner' || role === 'reviewer' || role === 'writer';
+
+/**
+ * Never allowed, whatever the project's allowlist says: agents do not push, merge pull requests, apply
+ * database migrations or touch GitHub. The orchestrator pushes and opens the PR; a human does the rest.
+ */
+export const ALWAYS_DENIED = [
+  'Bash(git push:*)',
+  'Bash(gh:*)',
+  'Bash(supabase db push:*)',
+  'Bash(npx supabase db push:*)',
+  'Bash(pnpm supabase db push:*)',
+  'Bash(pnpm exec supabase db push:*)',
+  'Bash(pnpm dlx supabase db push:*)',
+  'Bash(yarn supabase db push:*)',
+];
 
 export const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -56,7 +71,7 @@ export function resolveLaunchConfig(project: Project, settings: Settings, role: 
   return {
     profile: project.agentProfile || settings.agentProfile || 'lean',
     effort: effort && EFFORTS.includes(effort) ? effort : null,
-    model: roleCfg?.model || project.model || settings.defaultModel || null,
+    model: roleCfg?.model || project.model || settings.defaultModel || (role !== 'validator' ? ROLE_DEFAULT_MODEL[role] : '') || null,
     maxBudgetUsd: settings.maxBudgetUsd && settings.maxBudgetUsd > 0 ? settings.maxBudgetUsd : null,
     mcpConfig: project.mcpConfig?.trim() || null,
     allowedTools: readOnly ? READ_ONLY_ALLOWED : project.allowedTools,
@@ -87,7 +102,7 @@ export function buildClaudeArgs(prompt: string, cfg: LaunchConfig, opts: { resum
   /** MCP servers were selected: only those may be used, in either profile. */
   const restrictMcp = !!caps && caps.allowMcp.length > 0;
   const allowed = [...cfg.allowedTools, ...(restrictMcp ? caps!.allowMcp : []), ...skills.map((n) => `Skill(${n})`)];
-  const disallowed = [...(cfg.readOnly ? DISALLOWED_FOR_READ_ONLY : []), ...(restrictMcp && !caps!.strictMcp ? caps!.disallowMcp : [])];
+  const disallowed = [...ALWAYS_DENIED, ...(cfg.readOnly ? DISALLOWED_FOR_READ_ONLY : []), ...(restrictMcp && !caps!.strictMcp ? caps!.disallowMcp : [])];
   // Read-only roles run in the default permission mode: anything outside the read-only allowlist is denied.
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', cfg.readOnly ? 'default' : 'acceptEdits'];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
